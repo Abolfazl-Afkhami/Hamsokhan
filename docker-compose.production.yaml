@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  vllm-engine:
+    image: vllm/vllm-openai:latest
+    container_name: sts-vllm-service
+    runtime: nvidia
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+    volumes:
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - /root/.cache/huggingface:/root/.cache/huggingface
+    command: >
+      serve Qwen/Qwen2.5-7B-Instruct
+      --host 0.0.0.0
+      --port 8000
+      --dtype half
+      --gpu-memory-utilization 0.42
+      --max-model-len 2048
+      --enforce-eager
+    ipc: host
+    restart: always
+
+  sts-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sts-pipeline-gateway
+    runtime: nvidia
+    depends_on:
+      - vllm-engine
+    environment:
+      - CUDA_VISIBLE_DEVICES=0
+      - CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+      - LLM_API_BASE=http://vllm-engine:8000/v1
+    volumes:
+      - /tmp/nvidia-mps:/tmp/nvidia-mps
+      - ./configs:/app/configs
+      - ./assets:/app/assets
+      - ./checkpoints:/app/checkpoints
+    ports:
+      - "8765:8765"
+    ipc: host
+    restart: always

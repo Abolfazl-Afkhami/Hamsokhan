@@ -1,0 +1,27 @@
+# Core Deep Learning & Audio Frameworks
+torch>=2.2.0
+torchaudio>=2.2.0
+numpy>=1.24.0
+scipy>=1.11.0
+soundfile>=0.12.1
+pydub>=0.25.1
+
+# VAD & Streaming ASR
+faster-whisper>=1.0.0
+onnxruntime>=1.17.0
+
+# NLP & Persian Text Normalization
+hazm>=0.9.4
+num2fawords>=1.0.0
+regex>=2023.12.25
+pydantic>=2.6.0
+pyyaml>=6.0.1
+
+# LLM Streaming & Serving
+openai>=1.14.0
+httpx>=0.27.0
+aiohttp>=3.9.0
+
+# Flow Matching TTS & Audio Processing
+librosa>=0.10.1
+websockets>=12.0

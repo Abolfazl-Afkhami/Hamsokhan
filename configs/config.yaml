@@ -1,0 +1,78 @@
+# Persian Streaming STS Production Configuration - Phase 3 MVP
+
+system:
+  device: "cuda"            # "cuda" or "cpu"
+  precision: "float16"      # "float16", "bfloat16", "int8"
+  cuda_streams_isolated: true
+
+server:
+  host: "0.0.0.0"
+  port: 8765
+  ping_interval: 20
+  ping_timeout: 10
+
+audio:
+  input_sample_rate: 16000  # ASR native sample rate
+  output_sample_rate: 24000 # TTS native sample rate
+  channels: 1
+  chunk_duration_ms: 30     # 30ms -> 480 samples @ 16kHz
+  chunk_samples: 480
+
+vad:
+  engine: "silero"
+  threshold: 0.5
+  min_silence_duration_ms: 300
+  speech_pad_ms: 60
+  min_speech_frames: 3
+  min_speech_duration_ms: 250
+  terminal_silence_keep_ms: 80
+  max_speech_duration_sec: 8.0
+
+asr:
+  model_id: "openai/whisper-large-v3-turbo"
+  language: "fa"
+  beam_size: 1
+  vad_filter: false
+  temperature: 0.0
+  max_workers: 4
+
+nlp:
+  normalize_characters: true
+  convert_numbers: true
+  clean_half_spaces: true
+  diacritize_homographs: true
+
+llm:
+  api_base: "http://localhost:8000/v1"
+  api_key: "EMPTY"
+  model: "Qwen/Qwen2.5-7B-Instruct"
+  temperature: 0.6
+  max_tokens: 256
+  gpu_memory_utilization: 0.42
+  system_prompt: |
+    شما یک دستیار مکالمه‌ای فارسی‌زبان هوشمند، زنده و بسیار طبیعی هستید.
+    پاسخ‌های شما باید کاملاً محاوره‌ای، روان و صمیمی باشد.
+    برای هدایت موتور صوتی، از تگ‌های احساسی و ریتمیک استفاده کنید:
+    [tone: empathetic], [tone: cheerful], [tone: serious], [sigh], [laugh], [pause: 200ms]
+    پاسخ‌ها را کوتاه و محاوره‌ای بنویسید و از جملات طولانی و کتابی پرهیز کنید.
+
+chunking:
+  delimiters:
+    - "."
+    - "!"
+    - "؟"
+    - "،"
+    - "\n"
+    - "؛"
+  max_words_per_chunk: 12
+  min_words_per_chunk: 3
+
+tts:
+  engine: "flow_matching"   # CosyVoice-2 / F5-TTS
+  model_path: "checkpoints/persian_tts_flow.pt"
+  sample_rate: 24000
+  speed: 1.0
+  crossfade_ms: 15.0
+  speaker_reference:
+    audio_path: "assets/ref_speaker_tehrani.wav"
+    transcript: "سلام، من دستیار هوشمند صوتی شما هستم."
