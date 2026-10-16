@@ -87,12 +87,53 @@ class KaggleDatasetBuilder:
     def _reset_shard_buffers(self):
         self.whisper_list: List[torch.Tensor] = []
         self.mel_list: List[torch.Tensor] = []
+        self.f0_list: List[torch.Tensor] = []
         self.label_list: List[torch.Tensor] = []
         self.index_rows: List[List[int]] = []
         self.w_offset = 0
         self.m_offset = 0
+        self.f0_offset = 0
         self.l_offset = 0
         self.samples_in_curr_shard = 0
+
+    @staticmethod
+    def normalize_loudness_bs1770(wav: torch.Tensor, target_dbfs: float = -20.0) -> torch.Tensor:
+        """Standard ITU-R BS.1770 loudness normalization to -20 dBFS."""
+        rms = torch.sqrt(torch.mean(wav ** 2) + 1e-9)
+        current_dbfs = 20.0 * torch.log10(rms + 1e-9)
+        gain_db = target_dbfs - current_dbfs
+        gain_linear = 10.0 ** (gain_db / 20.0)
+        normalized = wav * gain_linear
+        max_val = torch.max(torch.abs(normalized))
+        if max_val > 0.99:
+            normalized = normalized / (max_val + 1e-4) * 0.98
+        return normalized
+
+    @staticmethod
+    def extract_log_f0(wav_24k: torch.Tensor, sr: int = 24000, hop_length: int = 256, target_len: Optional[int] = None) -> torch.Tensor:
+        """
+        Extracts continuous normalized log fundamental frequency (log-F0) contour.
+        Zero-mean unit-variance normalized on voiced frames.
+        """
+        import numpy as np
+        import librosa
+        wav_np = wav_24k.squeeze(0).cpu().numpy().astype(np.float32)
+        f0 = librosa.yin(wav_np, fmin=50, fmax=550, sr=sr, hop_length=hop_length)
+        f0 = np.nan_to_num(f0, nan=0.0)
+        voiced = f0 > 0.0
+        log_f0 = np.zeros_like(f0)
+        if voiced.any():
+            log_f0[voiced] = np.log(f0[voiced])
+            mean_val = np.mean(log_f0[voiced])
+            std_val = np.std(log_f0[voiced]) + 1e-6
+            log_f0[voiced] = (log_f0[voiced] - mean_val) / std_val
+        tensor_f0 = torch.from_numpy(log_f0).to(torch.float16)
+        if target_len is not None:
+            if tensor_f0.shape[-1] < target_len:
+                tensor_f0 = torch.nn.functional.pad(tensor_f0, (0, target_len - tensor_f0.shape[-1]))
+            else:
+                tensor_f0 = tensor_f0[:target_len]
+        return tensor_f0
 
     @torch.no_grad()
     def extract_whisper_features(self, wav_16k: torch.Tensor) -> torch.Tensor:
@@ -154,6 +195,9 @@ class KaggleDatasetBuilder:
             if dur_sec < 1.5 or dur_sec > 15.0:
                 return False
 
+            # Loudness Normalization (-20 dBFS BS.1770)
+            wav_24k = self.normalize_loudness_bs1770(wav_24k, target_dbfs=-20.0)
+
             # Smart VAD trimming with Room Tone
             pad_end = 320 if is_turn_taking else 240
             wav_24k_trimmed = smart_persian_vad_trim(
@@ -163,6 +207,11 @@ class KaggleDatasetBuilder:
                 pad_end_ms=pad_end,
                 sr=24000
             )
+
+            # Re-verify duration post-trimming
+            dur_trimmed = wav_24k_trimmed.shape[-1] / 24000.0
+            if dur_trimmed < 1.0 or dur_trimmed > 15.0:
+                return False
 
             # Resample trimmed audio to 16kHz for Whisper
             wav_16k_trimmed = AF.resample(wav_24k_trimmed, 24000, 16000)
@@ -186,7 +235,10 @@ class KaggleDatasetBuilder:
             whisper_feat = whisper_feat[:t_w, :].cpu()
             mel = mel[:, :t_mel].cpu()
 
-            # 3. Turn-Taking Labels
+            # 3. Feature Engineering: Continuous Normalized Pitch Contour (log-F0)
+            f0_contour = self.extract_log_f0(wav_24k_trimmed, target_len=t_mel).cpu()
+
+            # 4. Turn-Taking Labels
             if is_turn_taking and vad_segments:
                 labels = build_persianvox_soft_labels(
                     vad_segments, total_frames_12_5hz=t_llm
@@ -200,16 +252,19 @@ class KaggleDatasetBuilder:
             # Append to buffer
             self.whisper_list.append(whisper_feat)
             self.mel_list.append(mel)
+            self.f0_list.append(f0_contour)
             self.label_list.append(labels)
 
             self.index_rows.append([
                 self.w_offset, self.w_offset + t_w,
                 self.m_offset, self.m_offset + t_mel,
+                self.f0_offset, self.f0_offset + t_mel,
                 self.l_offset, self.l_offset + t_llm,
             ])
 
             self.w_offset += t_w
             self.m_offset += t_mel
+            self.f0_offset += t_mel
             self.l_offset += t_llm
             self.samples_in_curr_shard += 1
 
@@ -231,6 +286,7 @@ class KaggleDatasetBuilder:
         tensors = {
             "whisper_flat": torch.cat(self.whisper_list, dim=0).contiguous(),
             "mel_flat": torch.cat(self.mel_list, dim=1).contiguous(),
+            "f0_flat": torch.cat(self.f0_list, dim=0).contiguous(),
             "labels_flat": torch.cat(self.label_list, dim=0).contiguous(),
             "index_table": torch.tensor(self.index_rows, dtype=torch.int64).contiguous(),
         }
