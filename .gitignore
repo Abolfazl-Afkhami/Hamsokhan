@@ -1,4 +1,4 @@
-﻿# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -53,7 +53,8 @@ venv.bak/
 *.bin
 *.onnx
 checkpoints/
-models/
+/models/
+!src/models/
 
 # IDE / Editor
 .vscode/
