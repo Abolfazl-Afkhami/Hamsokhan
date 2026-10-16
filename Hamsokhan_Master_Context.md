@@ -90,3 +90,34 @@
 هر زمان این سند در پرامپت یا دانش Gem شما قرار دارد:
 - شما به عنوان **مهندس ارشد سیستم‌های هوش مصنوعی صوت (Principal AI Engineer)** در پروژه هم‌سخن پاسخ می‌دهید.
 - تمام پاسخ‌ها و راهکارها باید کاملاً منطبق بر محدودیت‌های سخت‌افزاری کگل (T4 16GB، سشن ۱۲ ساعته، دقت FP16 بدون BF16) و معماری تثبیت‌شده (Vocos 24kHz با بعد [B, 100, T]، هسته Qwen-0.6B و انکودر منجمد) باشد.
+
+---
+
+## ۵. پایگاه داده‌های صوت فارسی و تفکیک وظایف ۳ لایه‌ای (Dataset Landscape)
+
+| نام دیتاست (Dataset) | نرخ نمونه‌برداری (SR) | حجم (ساعت) | گویندگان | شناسه گوینده | کیفیت آکوستیک | مجوز | زمان‌بندی | سبک گفتار | فرمت |
+| :--- | :--- | :--- | :--- | :---: | :---: | :--- | :---: | :---: | :--- |
+| **YodaLingua-Farsi** | 24 kHz | 72 h | 678 | ✅ | ✅ > 3.0 | CC BY 4.0 | ❌ | ❌ رسمی | MP3 / Parquet |
+| **ManaTTS** | 44.1 kHz | 114+ h | 1 | ❌ | استودیویی عالی | CC0 | ⚠️ تراز در پایپ‌لاین | ❌ رسمی استودیویی | Audio / Parquet |
+| **ParsVoice** | 16 kHz | 2,177.9 h | 1,803 | ✅ | ⚠️ متادیتا بدون DNSMOS | بررسی مجزا | ❌ | ❌ رسمی / تلفنی | FLAC / Parquet |
+| **Persian-Speech-Dataset** | 16 kHz | ≈ 13 h | 87 | ✅ | ❌ | MIT | ❌ | ❌ با تگ احساسات | Audio / Parquet |
+| **Synthetic Farsi Diarization** | 16 kHz | ≈ 60 h | Synthetic | ⚠️ زمانی | MIT | ✅ مرز دقیق گوینده | ⚠️ سنتتیک | Audio / Parquet |
+| **PersianAudiobook** | 16 kHz | 218.56 h | نامشخص | ❌ | ❌ | Source-dependent | ⚠️ start_sec/end_sec | ❌ کتاب گویا | FLAC / Parquet |
+| **Persian-Farsi-Speech (Thomcles)** | **24 / 44.1 kHz** | **417 h** | Multi | ✅ | ✅ MOS > 3.5 | CC BY-SA 4.0 | ❌ | ❌ پالایش‌شده | Parquet / WAV |
+| **GPTInformal-Persian** | 44.1 kHz | 6+ h | 1 | ❌ | ✅ کیفیت بالا | CC BY-NC 4.0 | ⚠️ Segment-level | ✅ **محاوره‌ای خالص** | Audio / Parquet |
+| **PersianVox** | **16 kHz** | **~150 h** | Multi (Web) | ✅ | ⚠️ Prosody score | Research Only | ✅ **Turn timestamps** | ✅ **محاوره‌ای پادکست** | FLAC / Parquet |
+| **persian-voice-v1 (vhdm)** | 16 / 48 kHz | 100+ h | 1,000+ | ✅ | ⚠️ اصلاح GPT-4o | CC0 / MPL | ❌ | ❌ Common Voice | MP3 / Parquet |
+| **Filimo-Persian-ASR** | 16 kHz | 50+ h | Multi | ❌ | ⚠️ نویزی | Research | ⚠️ ساب‌تایتل سریال | ✅ محاوره‌ای عاطفی | WAV / Parquet |
+| **Neyshekar (نیشکر)** | 16 / 48 kHz | ~50 h | 500+ | ✅ | ❌ | Open Access (CC0) | ❌ | ⚠️ تنوع لهجه‌ها | WAV / Parquet |
+| **persian-tts-youtube-clean** | **24 / 44.1 kHz** | **32 h** | 1 | ✅ | ✅ > 3.2 | CC BY 4.0 | ⚠️ Sentence-level | ✅ **محاوره‌ای روان** | WAV / Parquet |
+
+### تفکیک وظایف ۳ لایه‌ای بر اساس محدودیت T4:
+1. **لایه ۱: سنتز آکوستیک (≥ 24kHz, MOS > 3.2):**
+   - داده‌های اصلی: **Thomcles (417h) + ManaTTS (114h) + YouTube Clean (32h)**.
+   - اعمال ریسمپل به ۲۴kHz، نرمال‌سازی -20 dBFS، برش VAD با حفظ ۱۶۰ms نویز محیطی و کوانتیزه‌سازی ۱۶۰ms.
+2. **لایه ۲: نوبت‌گیری و وقفه (Turn-Taking & Interruption):**
+   - داده‌های اصلی: **PersianVox (150h) + Synthetic Diarization (60h)**.
+   - آموزش هد باینری نوبت‌گیری با برچسب‌های شیب‌دار `[0.15, 0.35, 0.65, 1.0, 1.0, 1.0]` و جریمه مکث‌های تفکر (<720ms) به عنوان نمونه منفی سخت.
+3. **لایه ۳: حذفیات مهندسی از سنتز صوت (Pruned Workloads):**
+   - داده‌های ۱۶kHz نظیر ParsVoice و PersianAudiobook (افت وضوح Vocos به کیفیت تلفنی) و Filimo (نویز بالا و تداخل صدا).
+
