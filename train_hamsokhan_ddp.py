@@ -441,6 +441,9 @@ def train(args: argparse.Namespace):
     if accelerator.is_main_process:
         print(f"[Hamsokhan DDP] Training completed cleanly at step {global_step}.")
 
+    if torch.distributed.is_initialized():
+        torch.distributed.destroy_process_group()
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hamsokhan Dual-T4 Accelerate DDP Trainer")
