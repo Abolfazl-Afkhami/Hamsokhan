@@ -1,6 +1,6 @@
 """
 Causal Speech Projector (50Hz Whisper-Tiny to 12.5Hz Qwen SLM)
-Preserves Persian plosives (/پ/, /ت/, /ک/, /ب/, /د/, /گ/, /ق/, /ء/) with zero lookahead delay.
+Preserves Persian plosives (/p/, /t/, /k/, /b/, /d/, /g/, /q/) with zero lookahead delay.
 Architecture: Depthwise Causal Conv1D + Ring State Buffer + Linear Frame Stacking + SwiGLU.
 """
 

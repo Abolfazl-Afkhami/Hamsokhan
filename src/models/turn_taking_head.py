@@ -1,7 +1,7 @@
 """
 Turn-Taking Classifier Head & Asymmetric Focal Loss
 Designed for Persian full-duplex conversations on PersianVox dataset.
-Distinguishes thinking pauses ("اممم...", "خب...", "داشتم می‌گفتم...") from true sentence completion (where Persian verbs terminate the clause).
+Distinguishes thinking pauses (e.g. "ummm...", "well...", mid-clause hesitation) from true sentence completion (where Persian verbs terminate the clause).
 """
 
 from typing import List, Optional

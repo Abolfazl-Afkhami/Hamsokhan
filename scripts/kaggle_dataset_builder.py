@@ -1,6 +1,6 @@
 """
-Hamsokhan (هم‌سخن) — Kaggle Autonomous Dataset Preprocessing & Sharding Pipeline
-================================================================================
+Hamsokhan — Kaggle Autonomous Dataset Preprocessing & Sharding Pipeline
+========================================================================
 Designed to run in a standalone Kaggle Notebook with GPU acceleration.
 Processes Layer 1 (Thomcles, ManaTTS, YouTube Clean) and Layer 2 (PersianVox).
 Features:

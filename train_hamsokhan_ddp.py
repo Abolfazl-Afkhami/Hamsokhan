@@ -1,6 +1,6 @@
 """
-Hamsokhan (همسخن) — Dual NVIDIA T4 Accelerate FP16 DDP Training Script
-=======================================================================
+Hamsokhan — Dual NVIDIA T4 Accelerate FP16 DDP Training Script
+===============================================================
 Features:
 1. ShardedSpeechFeatureDataset + 160ms Macro-Packet Dynamic Collate Function
    (zero-copy mmap via .safetensors, preventing Copy-on-Write RAM leaks on Kaggle).

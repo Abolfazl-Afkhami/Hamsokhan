@@ -18,7 +18,7 @@ class StreamingWhisperASR:
     """
     Sub-second Persian ASR engine using Faster-Whisper.
     Includes zlib entropy checking and repetition loop suppression tuned to preserve
-    colloquial conversational affirmations (e.g. 'نه نه نه نه').
+    colloquial conversational affirmations (e.g. short repeated phrases).
     """
 
     def __init__(
@@ -53,7 +53,7 @@ class StreamingWhisperASR:
     def _is_hallucination_loop(self, text: str) -> bool:
         """
         Detects repetitive acoustic hallucination loops while preserving short
-        conversational affirmations ('نه نه نه نه', 'باشه باشه').
+        conversational affirmations (e.g. repeated colloquial phrases).
         """
         if not text or len(text) < 20:
             return False

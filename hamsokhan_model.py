@@ -1,6 +1,6 @@
 """
-Hamsokhan (همسخن) — Unified Speech-to-Speech Architecture for Kaggle Dual NVIDIA T4
-====================================================================================
+Hamsokhan — Unified Speech-to-Speech Architecture for Kaggle Dual NVIDIA T4
+=============================================================================
 Contains:
 1. HamsokhanConfig: Complete hyperparameter & alignment specification.
 2. CausalSpeechProjector: 50Hz (Whisper-Tiny) -> 12.5Hz (Qwen) zero-lookahead projector

@@ -78,7 +78,7 @@ def smart_persian_vad_trim(
 ) -> torch.Tensor:
     """
     Trims silence while preserving natural room tone and Persian phoneme edges:
-    - 160ms onset padding preserves plosive bursts (/پ/, /ت/, /ک/).
+    - 160ms onset padding preserves plosive bursts (/p/, /t/, /k/).
     - 240ms (TTS) or 320ms (PersianVox) offset padding preserves sentence-final devoicing/breath.
     - 15ms Hann cosine taper (360 samples) eliminates STFT boundary clicks.
     """

@@ -11,7 +11,7 @@ Step 5: Automated Checkpoint Upload Sanity Test to Hugging Face Hub
 """
 
 # %% [markdown]
-# # Hamsokhan V2 (هم‌سخن) - Pilot Sandbox Pipeline
+# # Hamsokhan V2 - Pilot Sandbox Pipeline
 # > **Architecture:** Causal Whisper-Tiny / SNAC -> Qwen3-0.6B (FP16 / LoRA) -> Turn-Taking Head -> Vocos 24kHz
 # > **Hardware Target:** Kaggle Dual NVIDIA T4 (16GB VRAM, No BF16, 12h Session Budget)
 
