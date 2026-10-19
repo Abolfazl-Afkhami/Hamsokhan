@@ -32,7 +32,7 @@ class HamsokhanConfig:
     d_qwen: int = 1024  # 1024 for Qwen3-0.6B (or 896 for Qwen2.5-0.5B)
     qwen_num_layers: int = 28
     turn_taking_mid_layer_idx: Optional[int] = None  # Defaults to qwen_num_layers // 2
-    use_4bit_quantization: bool = True
+    use_4bit_quantization: bool = False  # Pure FP16 is optimal for Qwen3-0.6B (< 1.2GB VRAM on 16GB T4)
 
     # LoRA configuration
     lora_r: int = 16
@@ -501,23 +501,37 @@ def build_qwen_lora_backbone(cfg: HamsokhanConfig, load_pretrained: bool = True)
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_quant_type="nf4",
                 )
+                device_idx = torch.cuda.current_device() if torch.cuda.is_available() else 0
+                quant_kwargs["device_map"] = {"": device_idx}
             except ImportError:
                 pass
 
-        base_lm = AutoModelForCausalLM.from_pretrained(
-            cfg.qwen_model_name_or_path,
-            torch_dtype=torch.float16,
-            attn_implementation="sdpa",
-            **quant_kwargs,
-        )
+        # Support both 'dtype' and backward-compatible 'torch_dtype'
+        load_kwargs = {"attn_implementation": "sdpa", **quant_kwargs}
+        try:
+            base_lm = AutoModelForCausalLM.from_pretrained(
+                cfg.qwen_model_name_or_path,
+                dtype=torch.float16,
+                **load_kwargs,
+            )
+        except TypeError:
+            base_lm = AutoModelForCausalLM.from_pretrained(
+                cfg.qwen_model_name_or_path,
+                torch_dtype=torch.float16,
+                **load_kwargs,
+            )
     else:
+        # Determine num_attention_heads so head_dim is even and cleanly divides hidden_size for RoPE
+        num_heads = cfg.d_qwen // 64 if (cfg.d_qwen % 64 == 0) else 16
+        num_kv_heads = max(2, num_heads // 2) if num_heads >= 4 else 2
+
         q_cfg = Qwen2Config(
             vocab_size=151936,
             hidden_size=cfg.d_qwen,
-            intermediate_size=cfg.d_qwen * 4,
+            intermediate_size=cfg.d_qwen * 3 if cfg.d_qwen == 1024 else cfg.d_qwen * 4,
             num_hidden_layers=cfg.qwen_num_layers,
-            num_attention_heads=14,
-            num_key_value_heads=2,
+            num_attention_heads=num_heads,
+            num_key_value_heads=num_kv_heads,
             max_position_embeddings=4096,
             torch_dtype=torch.float16,
         )

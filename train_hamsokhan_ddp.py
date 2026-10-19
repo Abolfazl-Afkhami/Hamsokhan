@@ -462,7 +462,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lr_lora", type=float, default=1e-4)
     parser.add_argument("--weight_decay", type=float, default=0.01)
     parser.add_argument("--max_grad_norm", type=float, default=1.0)
-    parser.add_argument("--use_4bit", action="store_true", default=True)
+    parser.add_argument("--use_4bit", action="store_true", default=False)
     parser.add_argument("--offline_mock_qwen", action="store_true", default=False)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
