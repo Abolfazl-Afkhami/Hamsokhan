@@ -27,10 +27,10 @@ import torch.nn.functional as F
 
 @dataclass
 class HamsokhanConfig:
-    # Backbone SLM (Qwen2.5-0.5B or Qwen3-0.6B)
-    qwen_model_name_or_path: str = "Qwen/Qwen2.5-0.5B"
-    d_qwen: int = 896  # Auto-updated from loaded Qwen config (896 for Qwen2.5-0.5B, 1024 for Qwen3-0.6B)
-    qwen_num_layers: int = 24
+    # Backbone SLM (Qwen3-0.6B non-thinking mode)
+    qwen_model_name_or_path: str = "Qwen/Qwen3-0.6B"
+    d_qwen: int = 1024  # 1024 for Qwen3-0.6B (or 896 for Qwen2.5-0.5B)
+    qwen_num_layers: int = 28
     turn_taking_mid_layer_idx: Optional[int] = None  # Defaults to qwen_num_layers // 2
     use_4bit_quantization: bool = True
 

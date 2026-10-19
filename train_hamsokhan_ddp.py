@@ -449,7 +449,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hamsokhan Dual-T4 Accelerate DDP Trainer")
     parser.add_argument("--shard_dir", type=str, default="/kaggle/working/cached_shards")
     parser.add_argument("--ckpt_dir", type=str, default="/kaggle/working/ckpts")
-    parser.add_argument("--qwen_model", type=str, default="Qwen/Qwen2.5-0.5B")
+    parser.add_argument("--backbone_model", "--qwen_model", dest="qwen_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--hf_repo_id", type=str, default="")
     parser.add_argument("--hf_token", type=str, default="")
     parser.add_argument("--batch_size_per_gpu", type=int, default=4)

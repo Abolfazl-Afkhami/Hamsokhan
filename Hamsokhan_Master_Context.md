@@ -72,7 +72,7 @@
 ### ساختار معماری تثبیت‌شده Hamsokhan V2 (Kaggle T4 Optimized):
 - **لایه لبه (Edge Processing - CPU/C++):** مدل Silero VAD v5 (بررسی ۱ms با پکت‌های علّی ۸۰ms) جهت تشخیص سریع قطع کلام صوتی (Instant Acoustic Barge-in).
 - **Acoustic Encoder (منجمد / Frozen):** مدل `Whisper-Tiny Encoder` با فریم‌بندی علّی (۳۹ میلیون پارامتر، مصرف حافظه ~۳۰۰MB) یا توکنایزر علّی `SNAC (12.5Hz)`.
-- **Reasoning SLM Backbone (هسته استدلال):** مدل چگال `Qwen3-0.6B` (یا `Qwen2.5-0.5B/1.5B`) با فرمت ۴ بیتی AWQ یا FP16 (مصرف VRAM کمتر از ۱.۲ تا ۱.۵ گیگابایت، سرعت بیش از ۸۵ توکن بر ثانیه روی T4 با غیرفعال‌سازی `enable_thinking`).
+- **Reasoning SLM Backbone (هسته استدلال):** مدل چگال `Qwen3-0.6B` در حالت استنتاج سریع بدون تفکر (`enable_thinking=False`) با فرمت ۴ بیتی NF4 یا FP16 (مصرف VRAM کمتر از ۱.۲ گیگابایت، سرعت بیش از ۹۰ توکن بر ثانیه روی T4).
   - مجهز به **Dual-Track LoRA Adapter** جهت انطباق با زبان گفتاری و محاوره‌ای فارسی.
   - مجهز به **Turn-Taking Binary Classifier Head** بر روی لایه‌های پنهان مدل جهت پیش‌بینی پایان نوبت کلام با داده‌های PersianVox.
 - **Acoustic Synthesizer (سنتز صوتی):** مدل تقطیرشده **Single-Step Rectified Flow (تک‌گامه)** با خروجی ابعاد دقیق اسپکتورگرام مِل `[B, 100, T]`.
