@@ -559,12 +559,21 @@ def build_qwen_lora_backbone(cfg: HamsokhanConfig, load_pretrained: bool = True)
             target_modules=list(cfg.lora_target_modules),
         )
         base_lm = get_peft_model(base_lm, lora_cfg)
+        # Cast LoRA parameters explicitly to FP32 for AMP GradScaler compatibility
+        for name, module in base_lm.named_modules():
+            if "lora_" in name:
+                module.to(torch.float32)
     except ImportError:
         # Fallback if PEFT is not installed in a minimal test environment: unfreeze last 2 transformer layers
         layers = base_lm.model.layers[-2:]
         for layer in layers:
             for param in layer.parameters():
                 param.requires_grad = True
+
+    # Ensure all trainable parameters in base_lm are strictly float32
+    for param in base_lm.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
 
     return base_lm
 
@@ -585,6 +594,12 @@ class HamsokhanModelWrapper(nn.Module):
         self.projector = CausalSpeechProjector(cfg)
         self.turn_taking_head = TurnTakingHead(cfg)
         self.flow_synthesizer = SingleStepFlowSynthesizer(cfg)
+
+        # Ensure all trainable parameters (LoRA adapters, Projector, Turn-Taking, Flow)
+        # are stored in FP32 so AMP GradScaler can unscale and clip gradients without error.
+        for param in self.parameters():
+            if param.requires_grad:
+                param.data = param.data.to(torch.float32)
 
     def _get_qwen_transformer_body(self) -> nn.Module:
         """Returns the inner transformer body (`Qwen2Model`) regardless of PEFT wrapping."""

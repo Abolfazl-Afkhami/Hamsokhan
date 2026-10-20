@@ -353,6 +353,11 @@ def train(args: argparse.Namespace):
     )
     model = HamsokhanModelWrapper(cfg, load_pretrained_qwen=not args.offline_mock_qwen)
 
+    # Ensure all trainable parameters are strictly FP32 so AMP GradScaler can unscale without error
+    for param in model.parameters():
+        if param.requires_grad:
+            param.data = param.data.to(torch.float32)
+
     optimizer = build_optimizer(
         model,
         lr_new_modules=args.lr_new,
@@ -390,59 +395,60 @@ def train(args: argparse.Namespace):
     global_step = 0
     start_time = time.time()
 
-    while global_step < args.max_steps:
-        for batch in dataloader:
-            with accelerator.accumulate(model):
-                outputs = model(
-                    whisper_features=batch["whisper_features"],
-                    vocos_mel=batch["vocos_mel"],
-                    turn_taking_labels=batch["turn_taking_labels"],
-                    attention_mask_12_5hz=batch["attention_mask_12_5hz"],
-                    mel_valid_mask=batch["mel_valid_mask"],
-                )
-                loss = outputs["loss"]
-                accelerator.backward(loss)
+    try:
+        while global_step < args.max_steps:
+            for batch in dataloader:
+                with accelerator.accumulate(model):
+                    outputs = model(
+                        whisper_features=batch["whisper_features"],
+                        vocos_mel=batch["vocos_mel"],
+                        turn_taking_labels=batch["turn_taking_labels"],
+                        attention_mask_12_5hz=batch["attention_mask_12_5hz"],
+                        mel_valid_mask=batch["mel_valid_mask"],
+                    )
+                    loss = outputs["loss"]
+                    accelerator.backward(loss)
+
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
+
+                    optimizer.step()
+                    scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
 
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), max_norm=args.max_grad_norm)
+                    global_step += 1
+                    loss_item = float(loss.detach().item())
 
-                optimizer.step()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
+                    if global_step % args.log_every == 0 and accelerator.is_main_process:
+                        elapsed = time.time() - start_time
+                        print(
+                            f"Step {global_step:05d}/{args.max_steps:05d} | "
+                            f"Total Loss: {loss_item:.4f} | "
+                            f"Flow: {float(outputs['flow_loss'].item()):.4f} "
+                            f"(SpecGrad: {float(outputs['spec_grad_loss'].item()):.4f}) | "
+                            f"TT Focal: {float(outputs['tt_loss'].item()):.4f} | "
+                            f"Elapsed: {elapsed:.1f}s"
+                        )
 
-            if accelerator.sync_gradients:
-                global_step += 1
-                loss_item = float(loss.detach().item())
-
-                if global_step % args.log_every == 0 and accelerator.is_main_process:
-                    elapsed = time.time() - start_time
-                    print(
-                        f"Step {global_step:05d}/{args.max_steps:05d} | "
-                        f"Total Loss: {loss_item:.4f} | "
-                        f"Flow: {float(outputs['flow_loss'].item()):.4f} "
-                        f"(SpecGrad: {float(outputs['spec_grad_loss'].item()):.4f}) | "
-                        f"TT Focal: {float(outputs['tt_loss'].item()):.4f} | "
-                        f"Elapsed: {elapsed:.1f}s"
+                    # Non-blocking async 500-step checkpoint snapshot + background upload
+                    ckpt_manager.maybe_save_async(
+                        accelerator=accelerator,
+                        model=model,
+                        step=global_step,
+                        loss_val=loss_item,
+                        save_every=args.save_every,
                     )
 
-                # Non-blocking async 500-step checkpoint snapshot + background upload
-                ckpt_manager.maybe_save_async(
-                    accelerator=accelerator,
-                    model=model,
-                    step=global_step,
-                    loss_val=loss_item,
-                    save_every=args.save_every,
-                )
+                    if global_step >= args.max_steps:
+                        break
+    finally:
+        ckpt_manager.finalize(accelerator)
+        if accelerator.is_main_process:
+            print(f"[Hamsokhan DDP] Training session closed cleanly at step {global_step}.")
 
-                if global_step >= args.max_steps:
-                    break
-
-    ckpt_manager.finalize(accelerator)
-    if accelerator.is_main_process:
-        print(f"[Hamsokhan DDP] Training completed cleanly at step {global_step}.")
-
-    if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
 
 
 def parse_args() -> argparse.Namespace:
