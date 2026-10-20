@@ -125,8 +125,20 @@ class KaggleDatasetBuilder:
         # 3. Text Normalizer
         self.text_normalizer = PersianTextNormalizer(convert_numbers=True)
 
-        # Buffer for active shard
-        self.curr_shard_idx = part_idx * 1000  # Unique shard prefix per part
+        # Buffer for active shard: auto-offset to prevent overwriting existing shards
+        existing_shards = list(self.output_dir.glob("features_shard_*.safetensors"))
+        if existing_shards:
+            indices = []
+            for p in existing_shards:
+                try:
+                    indices.append(int(p.stem.split("_")[-1]))
+                except ValueError:
+                    pass
+            self.curr_shard_idx = (max(indices) + 1) if indices else (part_idx * 1000)
+        else:
+            self.curr_shard_idx = part_idx * 1000
+
+        print(f"[DatasetBuilder] Next shard index will be: {self.curr_shard_idx:04d}")
         self._reset_shard_buffers()
 
     def _reset_shard_buffers(self):
@@ -462,8 +474,19 @@ class KaggleDatasetBuilder:
             wav_tensor = torch.from_numpy(wav_array).float()
             dur = wav_tensor.shape[-1] / float(sr)
 
-            # Metadata timestamps (if available in PersianVox / Diarization)
+            # Metadata timestamps (if available in Diarization / PersianVox)
             segments = item.get("segments", None)
+            if segments is None and "timestamps_start" in item and "timestamps_end" in item:
+                starts = item["timestamps_start"]
+                ends = item["timestamps_end"]
+                spks = item.get("speakers", [f"spk_{i}" for i in range(len(starts))])
+                if starts and ends:
+                    dur_approx = wav_tensor.shape[-1] / float(sr)
+                    scale = 0.001 if max(ends) > (dur_approx * 2) else 1.0
+                    segments = [
+                        {"speaker": str(spk), "start": float(s) * scale, "end": float(e) * scale}
+                        for spk, s, e in zip(spks, starts, ends)
+                    ]
 
             success = self.process_and_add_sample(
                 wav_audio=wav_tensor,
@@ -501,8 +524,20 @@ def main():
         "--dataset_type",
         type=str,
         default="thomcles",
-        choices=["thomcles", "persianvox", "manatts", "pilot", "synthetic", "custom"],
-        help="Predefined dataset type or 'pilot'/'synthetic' for local synthetic generation",
+        choices=[
+            "thomcles",
+            "commonvoice",
+            "manatts",
+            "youtube_clean",
+            "diarization",
+            "yodalingua",
+            "gpt_informal",
+            "persianvox",
+            "pilot",
+            "synthetic",
+            "custom",
+        ],
+        help="Predefined dataset type (or 'pilot'/'synthetic' for local synthetic generation)",
     )
     parser.add_argument("--dataset_name", type=str, default=None, help="Custom Hugging Face dataset name (overrides dataset_type)")
     parser.add_argument("--audio_col", type=str, default="audio", help="Column name containing audio data")
@@ -533,7 +568,7 @@ def main():
             dataset_name=args.dataset_name,
             split=args.split,
             audio_col=args.audio_col,
-            is_turn_taking=(args.dataset_type == "persianvox"),
+            is_turn_taking=(args.dataset_type in ["persianvox", "diarization", "gpt_informal"]),
         )
     elif args.dataset_type == "thomcles":
         builder.build_from_huggingface(
@@ -542,12 +577,12 @@ def main():
             audio_col=args.audio_col,
             is_turn_taking=False,
         )
-    elif args.dataset_type == "persianvox":
+    elif args.dataset_type == "commonvoice":
         builder.build_from_huggingface(
-            dataset_name="saeedzou/persianvox_all",
+            dataset_name="vhdm/persian-voice-v1",
             split=args.split,
             audio_col=args.audio_col,
-            is_turn_taking=True,
+            is_turn_taking=False,
         )
     elif args.dataset_type == "manatts":
         builder.build_from_huggingface(
@@ -555,6 +590,41 @@ def main():
             split=args.split,
             audio_col=args.audio_col,
             is_turn_taking=False,
+        )
+    elif args.dataset_type == "youtube_clean":
+        builder.build_from_huggingface(
+            dataset_name="ErfanRou/persian-tts-youtube-clean-32h",
+            split=args.split,
+            audio_col=args.audio_col,
+            is_turn_taking=False,
+        )
+    elif args.dataset_type == "diarization":
+        builder.build_from_huggingface(
+            dataset_name="uncleMehrzad/synthetic-speaker-diarization-dataset-fa-large-3000",
+            split=args.split,
+            audio_col=args.audio_col,
+            is_turn_taking=True,
+        )
+    elif args.dataset_type == "yodalingua":
+        builder.build_from_huggingface(
+            dataset_name="Thomcles/YodaLingua-Farsi",
+            split=args.split,
+            audio_col=args.audio_col,
+            is_turn_taking=False,
+        )
+    elif args.dataset_type == "gpt_informal":
+        builder.build_from_huggingface(
+            dataset_name="MahtaFetrat/GPTInformal-Persian",
+            split=args.split,
+            audio_col=args.audio_col,
+            is_turn_taking=True,
+        )
+    elif args.dataset_type == "persianvox":
+        builder.build_from_huggingface(
+            dataset_name="saeedzou/persianvox_all",
+            split=args.split,
+            audio_col=args.audio_col,
+            is_turn_taking=True,
         )
 
 
