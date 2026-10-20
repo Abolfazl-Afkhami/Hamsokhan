@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import io
 import math
 import os
 import sys
@@ -38,6 +39,31 @@ from src.data.persianvox_labeler import build_persianvox_soft_labels
 from src.nlp.normalizer import PersianTextNormalizer
 
 
+def resolve_hf_token(cli_token: Optional[str] = None) -> Optional[str]:
+    """
+    Resolves Hugging Face authentication token across multiple standard sources:
+    1. CLI argument (--hf_token)
+    2. Environment variables (HF_TOKEN, HUGGING_FACE_HUB_TOKEN)
+    3. Kaggle Secrets (UserSecretsClient().get_secret("HF_TOKEN"))
+    """
+    if cli_token and cli_token.strip():
+        return cli_token.strip()
+
+    env_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if env_token and env_token.strip():
+        return env_token.strip()
+
+    try:
+        from kaggle_secrets import UserSecretsClient
+        secret_token = UserSecretsClient().get_secret("HF_TOKEN")
+        if secret_token and secret_token.strip():
+            return secret_token.strip()
+    except Exception:
+        pass
+
+    return None
+
+
 class KaggleDatasetBuilder:
     """
     Autonomous streaming processor that builds memory-efficient .safetensors shards
@@ -50,6 +76,7 @@ class KaggleDatasetBuilder:
         num_parts: int = 1,
         max_hours_per_part: float = 20.0,
         shard_size_samples: int = 500,
+        hf_token: Optional[str] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.output_dir = Path(output_dir)
@@ -60,6 +87,20 @@ class KaggleDatasetBuilder:
         self.shard_size = shard_size_samples
         self.device = torch.device(device)
 
+        # Authenticate with Hugging Face Hub if token is available
+        self.hf_token = resolve_hf_token(hf_token)
+        if self.hf_token:
+            os.environ["HF_TOKEN"] = self.hf_token
+            os.environ["HUGGING_FACE_HUB_TOKEN"] = self.hf_token
+            try:
+                import huggingface_hub
+                huggingface_hub.login(token=self.hf_token, add_to_git_credential=False)
+                print("[DatasetBuilder] Authenticated with Hugging Face Hub successfully.")
+            except Exception as e:
+                print(f"[DatasetBuilder] Note: huggingface_hub.login returned: {e}")
+        else:
+            print("[DatasetBuilder] Warning: No HF_TOKEN detected. Gated Hugging Face datasets will fail.")
+
         print(f"[DatasetBuilder] Initializing on device: {self.device} | Part {part_idx + 1}/{num_parts}")
 
         # 1. Mel Extractor (Vocos 24kHz aligned)
@@ -68,10 +109,14 @@ class KaggleDatasetBuilder:
         # 2. Whisper-Tiny Encoder (Frozen, FP16)
         print("[DatasetBuilder] Loading Whisper-Tiny audio encoder...")
         self.whisper_model_id = "openai/whisper-tiny"
-        self.whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(self.whisper_model_id)
+        self.whisper_feature_extractor = AutoFeatureExtractor.from_pretrained(
+            self.whisper_model_id,
+            token=self.hf_token,
+        )
         whisper = AutoModel.from_pretrained(
             self.whisper_model_id,
-            torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
+            token=self.hf_token,
         ).to(self.device).eval()
         self.whisper_encoder = whisper.encoder
         for param in self.whisper_encoder.parameters():
@@ -255,10 +300,10 @@ class KaggleDatasetBuilder:
             self.f0_list.append(f0_contour)
             self.label_list.append(labels)
 
+            # Index table: [w_start, w_end, mel_start, mel_end, label_start, label_end]
             self.index_rows.append([
                 self.w_offset, self.w_offset + t_w,
                 self.m_offset, self.m_offset + t_mel,
-                self.f0_offset, self.f0_offset + t_mel,
                 self.l_offset, self.l_offset + t_llm,
             ])
 
@@ -286,10 +331,12 @@ class KaggleDatasetBuilder:
         tensors = {
             "whisper_flat": torch.cat(self.whisper_list, dim=0).contiguous(),
             "mel_flat": torch.cat(self.mel_list, dim=1).contiguous(),
-            "f0_flat": torch.cat(self.f0_list, dim=0).contiguous(),
             "labels_flat": torch.cat(self.label_list, dim=0).contiguous(),
             "index_table": torch.tensor(self.index_rows, dtype=torch.int64).contiguous(),
         }
+        if self.f0_list:
+            tensors["f0_flat"] = torch.cat(self.f0_list, dim=0).contiguous()
+
         save_file(tensors, str(shard_filename))
 
         self.curr_shard_idx += 1
@@ -297,6 +344,41 @@ class KaggleDatasetBuilder:
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    def build_pilot_shards(self, num_samples: int = 500):
+        """
+        Generates aligned synthetic pilot samples (160ms macro-packet aligned)
+        without requiring internet or gated Hugging Face access.
+        Enables instant local/offline testing of the training pipeline.
+        """
+        print(f"\n--- [Generating Pilot Synthetic Shards] ({num_samples} samples) ---")
+        t0 = time.time()
+        for i in range(num_samples):
+            macro_packets = 13 + (i % 18)
+            dur_sec = macro_packets * 0.16
+            n_samples_24k = macro_packets * 3840
+
+            t = torch.linspace(0, dur_sec, n_samples_24k)
+            f0 = 130.0 + 25.0 * torch.sin(2 * math.pi * 0.5 * t)
+            wav = 0.5 * torch.sin(2 * math.pi * f0 * t) + 0.25 * torch.sin(4 * math.pi * f0 * t)
+            wav = wav.unsqueeze(0)
+
+            is_tt = (i % 2 == 1)
+            vad_segs = [{"start": 0.16, "end": dur_sec - 0.24}] if is_tt else None
+
+            self.process_and_add_sample(
+                wav_audio=wav,
+                orig_sr=24000,
+                vad_segments=vad_segs,
+                is_turn_taking=is_tt,
+            )
+
+            if (i + 1) % 100 == 0 or (i + 1) == num_samples:
+                print(f"  Generated {i + 1}/{num_samples} pilot samples...")
+
+        self.save_current_shard()
+        elapsed = time.time() - t0
+        print(f"✓ Pilot Dataset Generation Complete in {elapsed:.1f}s.")
 
     def build_from_huggingface(
         self,
@@ -309,7 +391,35 @@ class KaggleDatasetBuilder:
         Streams dataset partition from Hugging Face and saves contiguous shards.
         """
         print(f"\n--- [Streaming Dataset] {dataset_name} (Part {self.part_idx + 1}/{self.num_parts}) ---")
-        ds = load_dataset(dataset_name, split=split, streaming=True)
+        load_kwargs = {"split": split, "streaming": True}
+        if self.hf_token:
+            load_kwargs["token"] = self.hf_token
+
+        try:
+            ds = load_dataset(dataset_name, **load_kwargs)
+        except Exception as err:
+            err_str = str(err)
+            print(f"\n[DatasetBuilder Error] Failed to stream '{dataset_name}': {err_str}\n")
+            if (
+                "gated" in err_str.lower()
+                or "not found" in err_str.lower()
+                or "401" in err_str
+                or "403" in err_str
+                or "authenticated" in err_str.lower()
+            ):
+                print(
+                    "=" * 74 + "\n"
+                    f"[HUGGING FACE ACCESS REQUIRED] Dataset '{dataset_name}' requires authentication:\n\n"
+                    f"1. Open https://huggingface.co/datasets/{dataset_name} in your browser.\n"
+                    "2. Accept the access terms (click 'Agree and access repository').\n"
+                    "3. Generate a Read token at https://huggingface.co/settings/tokens\n"
+                    "4. In Kaggle, add it under: Add-ons -> Secrets -> Name: 'HF_TOKEN'\n"
+                    "   Or pass --hf_token <your_token> to this command.\n\n"
+                    "TIP: You can also use '--dataset_type pilot' to generate local shards immediately\n"
+                    "     without waiting for Hugging Face access approval.\n"
+                    + "=" * 74
+                )
+            raise err
 
         target_total_sec = self.max_hours * 3600.0
         processed_sec = 0.0
@@ -321,9 +431,31 @@ class KaggleDatasetBuilder:
             if (idx % self.num_parts) != self.part_idx:
                 continue
 
-            audio_data = item.get(audio_col, {})
-            wav_array = audio_data.get("array")
-            sr = audio_data.get("sampling_rate", 24000)
+            # Robust audio column discovery
+            cur_col = audio_col
+            if cur_col not in item:
+                for candidate in ["audio", "speech", "wav", "sound", "file"]:
+                    if candidate in item:
+                        cur_col = candidate
+                        break
+
+            audio_data = item.get(cur_col)
+            wav_array = None
+            sr = 24000
+
+            if isinstance(audio_data, dict):
+                wav_array = audio_data.get("array")
+                sr = audio_data.get("sampling_rate", 24000)
+                if wav_array is None and audio_data.get("bytes"):
+                    wav_t, sr = torchaudio.load(io.BytesIO(audio_data["bytes"]))
+                    wav_array = wav_t.squeeze(0).numpy()
+                elif wav_array is None and audio_data.get("path") and os.path.exists(audio_data["path"]):
+                    wav_t, sr = torchaudio.load(audio_data["path"])
+                    wav_array = wav_t.squeeze(0).numpy()
+            elif isinstance(audio_data, str) and os.path.exists(audio_data):
+                wav_t, sr = torchaudio.load(audio_data)
+                wav_array = wav_t.squeeze(0).numpy()
+
             if wav_array is None:
                 continue
 
@@ -365,12 +497,25 @@ class KaggleDatasetBuilder:
 def main():
     parser = argparse.ArgumentParser(description="Hamsokhan Kaggle Autonomous Dataset Preprocessing")
     parser.add_argument("--output_dir", type=str, default="/kaggle/working/hamsokhan_shards")
-    parser.add_argument("--dataset_type", type=str, default="thomcles", choices=["thomcles", "persianvox", "manatts"])
+    parser.add_argument(
+        "--dataset_type",
+        type=str,
+        default="thomcles",
+        choices=["thomcles", "persianvox", "manatts", "pilot", "synthetic", "custom"],
+        help="Predefined dataset type or 'pilot'/'synthetic' for local synthetic generation",
+    )
+    parser.add_argument("--dataset_name", type=str, default=None, help="Custom Hugging Face dataset name (overrides dataset_type)")
+    parser.add_argument("--audio_col", type=str, default="audio", help="Column name containing audio data")
+    parser.add_argument("--split", type=str, default="train", help="Dataset split to stream")
+    parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face access token (or set via HF_TOKEN secret)")
     parser.add_argument("--part_idx", type=int, default=0, help="Partition index (0-indexed)")
     parser.add_argument("--num_parts", type=int, default=1, help="Total number of partitions (e.g. 4 for 4x20GB)")
     parser.add_argument("--max_hours", type=float, default=5.0, help="Maximum audio hours for this part")
     parser.add_argument("--shard_size", type=int, default=500, help="Samples per .safetensors shard")
+    parser.add_argument("--num_pilot_samples", type=int, default=500, help="Number of samples if running in pilot mode")
     args = parser.parse_args()
+
+    hf_token = resolve_hf_token(args.hf_token)
 
     builder = KaggleDatasetBuilder(
         output_dir=args.output_dir,
@@ -378,27 +523,37 @@ def main():
         num_parts=args.num_parts,
         max_hours_per_part=args.max_hours,
         shard_size_samples=args.shard_size,
+        hf_token=hf_token,
     )
 
-    if args.dataset_type == "thomcles":
+    if args.dataset_type in ["pilot", "synthetic"]:
+        builder.build_pilot_shards(num_samples=args.num_pilot_samples)
+    elif args.dataset_name:
+        builder.build_from_huggingface(
+            dataset_name=args.dataset_name,
+            split=args.split,
+            audio_col=args.audio_col,
+            is_turn_taking=(args.dataset_type == "persianvox"),
+        )
+    elif args.dataset_type == "thomcles":
         builder.build_from_huggingface(
             dataset_name="Thomcles/Persian-Farsi-Speech",
-            split="train",
-            audio_col="audio",
+            split=args.split,
+            audio_col=args.audio_col,
             is_turn_taking=False,
         )
     elif args.dataset_type == "persianvox":
         builder.build_from_huggingface(
             dataset_name="saeedzou/persianvox_all",
-            split="train",
-            audio_col="audio",
+            split=args.split,
+            audio_col=args.audio_col,
             is_turn_taking=True,
         )
     elif args.dataset_type == "manatts":
         builder.build_from_huggingface(
-            dataset_name="hezarai/mana-tts",
-            split="train",
-            audio_col="audio",
+            dataset_name="MahtaFetrat/Mana-TTS",
+            split=args.split,
+            audio_col=args.audio_col,
             is_turn_taking=False,
         )
 

@@ -67,7 +67,11 @@ class ShardedSpeechFeatureDataset(Dataset):
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
         row = self.global_index[idx]
         shard_id = int(row[0].item())
-        w_s, w_e, m_s, m_e, l_s, l_e = (int(x.item()) for x in row[1:])
+        vals = [int(x.item()) for x in row[1:]]
+        if len(vals) == 8:
+            w_s, w_e, m_s, m_e, _, _, l_s, l_e = vals
+        else:
+            w_s, w_e, m_s, m_e, l_s, l_e = vals[:6]
 
         with safe_open(self.shard_paths[shard_id], framework="pt", device="cpu") as f:
             whisper_feat = f.get_slice("whisper_flat")[w_s:w_e, :]  # [T_w, 384] FP16
@@ -374,13 +378,25 @@ def train(args: argparse.Namespace):
         model, optimizer, dataloader, scheduler
     )
 
+    # Resolve Hugging Face Hub token from arguments, environment, or Kaggle Secrets
+    resolved_hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if not resolved_hf_token:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            resolved_hf_token = UserSecretsClient().get_secret("HF_TOKEN")
+        except Exception:
+            pass
+    if resolved_hf_token:
+        os.environ["HF_TOKEN"] = resolved_hf_token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = resolved_hf_token
+
     # 3. Initialize Non-Blocking Async Checkpoint Manager
     ckpt_manager = AsyncHFHubCheckpointManager(
         repo_id=args.hf_repo_id,
-        hf_token=os.environ.get("HF_TOKEN", args.hf_token),
+        hf_token=resolved_hf_token,
         local_dir=args.ckpt_dir,
         max_keep_local=2,
-        enable_hub_upload=bool(args.hf_repo_id and (os.environ.get("HF_TOKEN") or args.hf_token)),
+        enable_hub_upload=bool(args.hf_repo_id and resolved_hf_token),
     )
 
     if accelerator.is_main_process:
