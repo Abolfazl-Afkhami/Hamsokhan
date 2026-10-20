@@ -306,6 +306,59 @@ def generate_dummy_shard_if_needed(shard_dir: Path, num_samples: int = 16) -> Li
     return [str(shard_path)]
 
 
+def evaluate_validation_loss(
+    model: torch.nn.Module,
+    val_dataloader: Optional[DataLoader],
+    accelerator: Accelerator,
+    max_eval_batches: int = 25,
+) -> Dict[str, float]:
+    """
+    Evaluates current model on validation shards and aggregates metrics.
+    """
+    if val_dataloader is None:
+        return {}
+
+    unwrapped = accelerator.unwrap_model(model)
+    was_training = unwrapped.training
+    unwrapped.eval()
+
+    val_loss_sum = 0.0
+    val_flow_sum = 0.0
+    val_spec_sum = 0.0
+    val_tt_sum = 0.0
+    batches_counted = 0
+
+    with torch.no_grad():
+        for b_idx, batch in enumerate(val_dataloader):
+            if b_idx >= max_eval_batches:
+                break
+            outputs = model(
+                whisper_features=batch["whisper_features"],
+                vocos_mel=batch["vocos_mel"],
+                turn_taking_labels=batch["turn_taking_labels"],
+                attention_mask_12_5hz=batch["attention_mask_12_5hz"],
+                mel_valid_mask=batch["mel_valid_mask"],
+            )
+            val_loss_sum += float(outputs["loss"].item())
+            val_flow_sum += float(outputs["flow_loss"].item())
+            val_spec_sum += float(outputs["spec_grad_loss"].item())
+            val_tt_sum += float(outputs["tt_loss"].item())
+            batches_counted += 1
+
+    if was_training:
+        unwrapped.train()
+
+    if batches_counted == 0:
+        return {}
+
+    return {
+        "val_total_loss": val_loss_sum / batches_counted,
+        "val_flow_loss": val_flow_sum / batches_counted,
+        "val_spec_grad": val_spec_sum / batches_counted,
+        "val_tt_loss": val_tt_sum / batches_counted,
+    }
+
+
 def train(args: argparse.Namespace):
     set_seed(args.seed)
 
@@ -329,18 +382,31 @@ def train(args: argparse.Namespace):
         kwargs_handlers=[scaler_kwargs, ddp_kwargs],
     )
 
-    # 1. Discover or synthesize feature shards
-    shard_dir = Path(args.shard_dir)
-    shard_paths = sorted([str(p) for p in shard_dir.glob("*.safetensors")]) if shard_dir.exists() else []
-    if not shard_paths:
-        if accelerator.is_main_process:
-            generate_dummy_shard_if_needed(shard_dir, num_samples=24)
-        accelerator.wait_for_everyone()
-        shard_paths = sorted([str(p) for p in shard_dir.glob("*.safetensors")])
+    # 1. Discover Train and Validation Feature Shards
+    train_dir = Path(args.train_shard_dir) if args.train_shard_dir else (Path(args.shard_dir) / "train")
+    val_dir = Path(args.val_shard_dir) if args.val_shard_dir else (Path(args.shard_dir) / "val")
 
-    dataset = ShardedSpeechFeatureDataset(shard_paths)
+    if train_dir.exists() and list(train_dir.glob("*.safetensors")):
+        train_shard_paths = sorted([str(p) for p in train_dir.glob("*.safetensors")])
+    else:
+        train_shard_paths = sorted([str(p) for p in Path(args.shard_dir).glob("*.safetensors")])
+
+    val_shard_paths: List[str] = []
+    if val_dir.exists() and list(val_dir.glob("*.safetensors")):
+        val_shard_paths = sorted([str(p) for p in val_dir.glob("*.safetensors")])
+
+    if not train_shard_paths:
+        if accelerator.is_main_process:
+            generate_dummy_shard_if_needed(Path(args.shard_dir), num_samples=24)
+        accelerator.wait_for_everyone()
+        train_shard_paths = sorted([str(p) for p in Path(args.shard_dir).glob("*.safetensors")])
+
+    if accelerator.is_main_process:
+        print(f"[Hamsokhan DDP] Loaded {len(train_shard_paths)} training shards, {len(val_shard_paths)} validation shards.")
+
+    train_dataset = ShardedSpeechFeatureDataset(train_shard_paths)
     dataloader = DataLoader(
-        dataset,
+        train_dataset,
         batch_size=args.batch_size_per_gpu,
         shuffle=True,
         num_workers=args.num_workers,
@@ -349,6 +415,19 @@ def train(args: argparse.Namespace):
         persistent_workers=(args.num_workers > 0),
         drop_last=True,
     )
+
+    val_dataloader: Optional[DataLoader] = None
+    if val_shard_paths:
+        val_dataset = ShardedSpeechFeatureDataset(val_shard_paths)
+        val_dataloader = DataLoader(
+            val_dataset,
+            batch_size=args.batch_size_per_gpu,
+            shuffle=False,
+            num_workers=1,
+            collate_fn=hamsokhan_collate_fn,
+            pin_memory=torch.cuda.is_available(),
+            drop_last=False,
+        )
 
     # 2. Initialize Model, Optimizer & Scheduler
     cfg = HamsokhanConfig(
@@ -362,6 +441,19 @@ def train(args: argparse.Namespace):
         if param.requires_grad:
             param.data = param.data.to(torch.float32)
 
+    # Resume trainable weights if checkpoint specified
+    if args.resume_from_ckpt and os.path.exists(args.resume_from_ckpt):
+        ckpt_candidate = Path(args.resume_from_ckpt)
+        if ckpt_candidate.is_dir():
+            file_cand = ckpt_candidate / "trainable_hamsokhan.safetensors"
+            if file_cand.exists():
+                ckpt_candidate = file_cand
+        if ckpt_candidate.exists():
+            if accelerator.is_main_process:
+                print(f"[Hamsokhan DDP] Resuming trainable weights from: {ckpt_candidate}")
+            res_weights = load_file(str(ckpt_candidate))
+            model.load_state_dict(res_weights, strict=False)
+
     optimizer = build_optimizer(
         model,
         lr_new_modules=args.lr_new,
@@ -374,9 +466,14 @@ def train(args: argparse.Namespace):
     cosine_sched = CosineAnnealingLR(optimizer, T_max=max(1, args.max_steps - warmup_steps), eta_min=1e-6)
     scheduler = SequentialLR(optimizer, schedulers=[warmup_sched, cosine_sched], milestones=[warmup_steps])
 
-    model, optimizer, dataloader, scheduler = accelerator.prepare(
-        model, optimizer, dataloader, scheduler
-    )
+    if val_dataloader is not None:
+        model, optimizer, dataloader, scheduler, val_dataloader = accelerator.prepare(
+            model, optimizer, dataloader, scheduler, val_dataloader
+        )
+    else:
+        model, optimizer, dataloader, scheduler = accelerator.prepare(
+            model, optimizer, dataloader, scheduler
+        )
 
     # Resolve Hugging Face Hub token from arguments, environment, or Kaggle Secrets
     resolved_hf_token = args.hf_token or os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
@@ -398,6 +495,9 @@ def train(args: argparse.Namespace):
         max_keep_local=2,
         enable_hub_upload=bool(args.hf_repo_id and resolved_hf_token),
     )
+
+    best_val_loss = float("inf")
+    best_ckpt_dir = Path(args.ckpt_dir) / "best_model"
 
     if accelerator.is_main_process:
         trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -447,7 +547,28 @@ def train(args: argparse.Namespace):
                             f"Elapsed: {elapsed:.1f}s"
                         )
 
-                    # Non-blocking async 500-step checkpoint snapshot + background upload
+                    # Validation evaluation loop
+                    if global_step % args.eval_every == 0 and val_dataloader is not None:
+                        val_metrics = evaluate_validation_loss(model, val_dataloader, accelerator)
+                        if val_metrics and accelerator.is_main_process:
+                            v_loss = val_metrics["val_total_loss"]
+                            print(
+                                f"  [Validation @ Step {global_step}] Loss: {v_loss:.4f} (Best: {best_val_loss:.4f}) | "
+                                f"Flow: {val_metrics['val_flow_loss']:.4f} (SpecGrad: {val_metrics['val_spec_grad']:.4f}) | "
+                                f"TT Focal: {val_metrics['val_tt_loss']:.4f}"
+                            )
+                            if v_loss < best_val_loss:
+                                best_val_loss = v_loss
+                                best_ckpt_dir.mkdir(parents=True, exist_ok=True)
+                                snap = AsyncHFHubCheckpointManager._extract_trainable_cpu_snapshot(accelerator.unwrap_model(model))
+                                save_file(
+                                    snap,
+                                    str(best_ckpt_dir / "trainable_hamsokhan.safetensors"),
+                                    metadata={"step": str(global_step), "val_loss": f"{best_val_loss:.4f}"},
+                                )
+                                print(f"  ★ [New Best Checkpoint] Saved to {best_ckpt_dir.name} (val_loss={best_val_loss:.4f})")
+
+                    # Non-blocking async checkpoint snapshot + background upload
                     ckpt_manager.maybe_save_async(
                         accelerator=accelerator,
                         model=model,
@@ -470,7 +591,10 @@ def train(args: argparse.Namespace):
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Hamsokhan Dual-T4 Accelerate DDP Trainer")
     parser.add_argument("--shard_dir", type=str, default="/kaggle/working/cached_shards")
+    parser.add_argument("--train_shard_dir", type=str, default="", help="Directory with train shards (default: shard_dir/train)")
+    parser.add_argument("--val_shard_dir", type=str, default="", help="Directory with validation shards (default: shard_dir/val)")
     parser.add_argument("--ckpt_dir", type=str, default="/kaggle/working/ckpts")
+    parser.add_argument("--resume_from_ckpt", type=str, default="", help="Path to checkpoint file to resume from")
     parser.add_argument("--backbone_model", "--qwen_model", dest="qwen_model", type=str, default="Qwen/Qwen3-0.6B")
     parser.add_argument("--hf_repo_id", type=str, default="")
     parser.add_argument("--hf_token", type=str, default="")
@@ -479,6 +603,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--max_steps", type=int, default=5000)
     parser.add_argument("--save_every", type=int, default=500)
+    parser.add_argument("--eval_every", type=int, default=250, help="Evaluate validation loss every N steps")
     parser.add_argument("--log_every", type=int, default=25)
     parser.add_argument("--lr_new", type=float, default=2e-4)
     parser.add_argument("--lr_lora", type=float, default=1e-4)

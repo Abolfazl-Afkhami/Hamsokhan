@@ -64,10 +64,105 @@ def resolve_hf_token(cli_token: Optional[str] = None) -> Optional[str]:
     return None
 
 
+class PartitionBuffer:
+    """
+    Manages contiguous feature buffering and atomic .safetensors shard flushing
+    for a dedicated data partition (train, val, or test).
+    """
+    def __init__(self, partition_name: str, target_dir: Path, shard_size: int, part_idx: int):
+        self.name = partition_name
+        self.target_dir = target_dir
+        self.target_dir.mkdir(parents=True, exist_ok=True)
+        self.shard_size = shard_size
+        self.part_idx = part_idx
+
+        # Auto-offset to prevent overwriting existing shards
+        existing_shards = list(self.target_dir.glob("features_shard_*.safetensors"))
+        if existing_shards:
+            indices = []
+            for p in existing_shards:
+                try:
+                    indices.append(int(p.stem.split("_")[-1]))
+                except ValueError:
+                    pass
+            self.curr_shard_idx = (max(indices) + 1) if indices else (part_idx * 1000)
+        else:
+            self.curr_shard_idx = part_idx * 1000
+
+        print(f"  [{self.name.upper()}] Starting shard index: {self.curr_shard_idx:04d} in {self.target_dir}")
+        self.reset()
+
+    def reset(self):
+        self.whisper_list: List[torch.Tensor] = []
+        self.mel_list: List[torch.Tensor] = []
+        self.f0_list: List[torch.Tensor] = []
+        self.label_list: List[torch.Tensor] = []
+        self.index_rows: List[List[int]] = []
+        self.w_offset = 0
+        self.m_offset = 0
+        self.f0_offset = 0
+        self.l_offset = 0
+        self.samples_in_curr_shard = 0
+
+    def append_sample(
+        self,
+        whisper_feat: torch.Tensor,
+        mel: torch.Tensor,
+        f0_contour: torch.Tensor,
+        labels: torch.Tensor,
+        t_w: int,
+        t_mel: int,
+        t_llm: int,
+    ):
+        self.whisper_list.append(whisper_feat)
+        self.mel_list.append(mel)
+        self.f0_list.append(f0_contour)
+        self.label_list.append(labels)
+
+        self.index_rows.append([
+            self.w_offset, self.w_offset + t_w,
+            self.m_offset, self.m_offset + t_mel,
+            self.l_offset, self.l_offset + t_llm,
+        ])
+
+        self.w_offset += t_w
+        self.m_offset += t_mel
+        self.f0_offset += t_mel
+        self.l_offset += t_llm
+        self.samples_in_curr_shard += 1
+
+        if self.samples_in_curr_shard >= self.shard_size:
+            self.flush()
+
+    def flush(self):
+        if not self.whisper_list:
+            return
+
+        shard_filename = self.target_dir / f"features_shard_{self.curr_shard_idx:04d}.safetensors"
+        print(f"  [Disk Write ({self.name})] Saving shard: {shard_filename.name} ({self.samples_in_curr_shard} utterances)...")
+
+        tensors = {
+            "whisper_flat": torch.cat(self.whisper_list, dim=0).contiguous(),
+            "mel_flat": torch.cat(self.mel_list, dim=1).contiguous(),
+            "labels_flat": torch.cat(self.label_list, dim=0).contiguous(),
+            "index_table": torch.tensor(self.index_rows, dtype=torch.int64).contiguous(),
+        }
+        if self.f0_list:
+            tensors["f0_flat"] = torch.cat(self.f0_list, dim=0).contiguous()
+
+        save_file(tensors, str(shard_filename))
+        self.curr_shard_idx += 1
+        self.reset()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
 class KaggleDatasetBuilder:
     """
     Autonomous streaming processor that builds memory-efficient .safetensors shards
     from Hugging Face datasets directly in a Kaggle notebook.
+    Supports Train / Validation / Test automatic splitting.
     """
     def __init__(
         self,
@@ -77,6 +172,8 @@ class KaggleDatasetBuilder:
         max_hours_per_part: float = 20.0,
         shard_size_samples: int = 500,
         hf_token: Optional[str] = None,
+        split_ratios: Tuple[float, float, float] = (0.85, 0.10, 0.05),
+        no_split: bool = False,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.output_dir = Path(output_dir)
@@ -86,6 +183,8 @@ class KaggleDatasetBuilder:
         self.max_hours = max_hours_per_part
         self.shard_size = shard_size_samples
         self.device = torch.device(device)
+        self.split_ratios = split_ratios
+        self.no_split = no_split
 
         # Authenticate with Hugging Face Hub if token is available
         self.hf_token = resolve_hf_token(hf_token)
@@ -125,33 +224,37 @@ class KaggleDatasetBuilder:
         # 3. Text Normalizer
         self.text_normalizer = PersianTextNormalizer(convert_numbers=True)
 
-        # Buffer for active shard: auto-offset to prevent overwriting existing shards
-        existing_shards = list(self.output_dir.glob("features_shard_*.safetensors"))
-        if existing_shards:
-            indices = []
-            for p in existing_shards:
-                try:
-                    indices.append(int(p.stem.split("_")[-1]))
-                except ValueError:
-                    pass
-            self.curr_shard_idx = (max(indices) + 1) if indices else (part_idx * 1000)
+        # 4. Partition Buffers (Train, Val, Test)
+        if self.no_split:
+            self.partitions: Dict[str, PartitionBuffer] = {
+                "train": PartitionBuffer("train", self.output_dir, self.shard_size, part_idx)
+            }
         else:
-            self.curr_shard_idx = part_idx * 1000
+            val_test_shard_size = max(50, min(100, self.shard_size // 5))
+            self.partitions: Dict[str, PartitionBuffer] = {
+                "train": PartitionBuffer("train", self.output_dir / "train", self.shard_size, part_idx),
+                "val": PartitionBuffer("val", self.output_dir / "val", val_test_shard_size, part_idx),
+                "test": PartitionBuffer("test", self.output_dir / "test", val_test_shard_size, part_idx),
+            }
 
-        print(f"[DatasetBuilder] Next shard index will be: {self.curr_shard_idx:04d}")
-        self._reset_shard_buffers()
+    def _select_partition(self, sample_idx: int) -> PartitionBuffer:
+        if self.no_split:
+            return self.partitions["train"]
 
-    def _reset_shard_buffers(self):
-        self.whisper_list: List[torch.Tensor] = []
-        self.mel_list: List[torch.Tensor] = []
-        self.f0_list: List[torch.Tensor] = []
-        self.label_list: List[torch.Tensor] = []
-        self.index_rows: List[List[int]] = []
-        self.w_offset = 0
-        self.m_offset = 0
-        self.f0_offset = 0
-        self.l_offset = 0
-        self.samples_in_curr_shard = 0
+        mod = sample_idx % 100
+        train_thresh = int(self.split_ratios[0] * 100)
+        val_thresh = train_thresh + int(self.split_ratios[1] * 100)
+        if mod < train_thresh:
+            return self.partitions["train"]
+        elif mod < val_thresh:
+            return self.partitions["val"]
+        else:
+            return self.partitions["test"]
+
+    def flush_all(self):
+        """Flushes all partition buffers to disk."""
+        for p in self.partitions.values():
+            p.flush()
 
     @staticmethod
     def normalize_loudness_bs1770(wav: torch.Tensor, target_dbfs: float = -20.0) -> torch.Tensor:
@@ -226,6 +329,7 @@ class KaggleDatasetBuilder:
         orig_sr: int,
         vad_segments: Optional[List[Dict]] = None,
         is_turn_taking: bool = False,
+        sample_idx: int = 0,
     ) -> bool:
         """
         Processes a single raw audio item:
@@ -233,7 +337,7 @@ class KaggleDatasetBuilder:
         2. Smart VAD trimming (160ms onset, 240/320ms offset).
         3. Extraction of Vocos Mel [100, 15*K] and Whisper [8*K, 384].
         4. Generation of Soft Turn-Taking labels [2*K].
-        5. Appends to active shard.
+        5. Routes to designated partition buffer (train, val, or test).
         """
         try:
             if wav_audio.dim() == 1:
@@ -306,56 +410,25 @@ class KaggleDatasetBuilder:
                 if t_llm >= 6:
                     labels[-6:] = torch.tensor([0.15, 0.35, 0.65, 1.0, 1.0, 1.0], dtype=torch.float16)
 
-            # Append to buffer
-            self.whisper_list.append(whisper_feat)
-            self.mel_list.append(mel)
-            self.f0_list.append(f0_contour)
-            self.label_list.append(labels)
-
-            # Index table: [w_start, w_end, mel_start, mel_end, label_start, label_end]
-            self.index_rows.append([
-                self.w_offset, self.w_offset + t_w,
-                self.m_offset, self.m_offset + t_mel,
-                self.l_offset, self.l_offset + t_llm,
-            ])
-
-            self.w_offset += t_w
-            self.m_offset += t_mel
-            self.f0_offset += t_mel
-            self.l_offset += t_llm
-            self.samples_in_curr_shard += 1
-
-            if self.samples_in_curr_shard >= self.shard_size:
-                self.save_current_shard()
+            # Route to designated partition buffer (train, val, or test)
+            partition = self._select_partition(sample_idx)
+            partition.append_sample(
+                whisper_feat=whisper_feat,
+                mel=mel,
+                f0_contour=f0_contour,
+                labels=labels,
+                t_w=t_w,
+                t_mel=t_mel,
+                t_llm=t_llm,
+            )
 
             return True
         except Exception as err:
             return False
 
     def save_current_shard(self):
-        """Flushes buffered samples to a contiguous .safetensors shard on disk."""
-        if not self.whisper_list:
-            return
-
-        shard_filename = self.output_dir / f"features_shard_{self.curr_shard_idx:04d}.safetensors"
-        print(f"  [Disk Write] Saving shard: {shard_filename.name} ({self.samples_in_curr_shard} utterances)...")
-
-        tensors = {
-            "whisper_flat": torch.cat(self.whisper_list, dim=0).contiguous(),
-            "mel_flat": torch.cat(self.mel_list, dim=1).contiguous(),
-            "labels_flat": torch.cat(self.label_list, dim=0).contiguous(),
-            "index_table": torch.tensor(self.index_rows, dtype=torch.int64).contiguous(),
-        }
-        if self.f0_list:
-            tensors["f0_flat"] = torch.cat(self.f0_list, dim=0).contiguous()
-
-        save_file(tensors, str(shard_filename))
-
-        self.curr_shard_idx += 1
-        self._reset_shard_buffers()
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        """Flushes all partition buffers to disk."""
+        self.flush_all()
 
     def build_pilot_shards(self, num_samples: int = 500):
         """
@@ -383,12 +456,13 @@ class KaggleDatasetBuilder:
                 orig_sr=24000,
                 vad_segments=vad_segs,
                 is_turn_taking=is_tt,
+                sample_idx=i,
             )
 
             if (i + 1) % 100 == 0 or (i + 1) == num_samples:
                 print(f"  Generated {i + 1}/{num_samples} pilot samples...")
 
-        self.save_current_shard()
+        self.flush_all()
         elapsed = time.time() - t0
         print(f"✓ Pilot Dataset Generation Complete in {elapsed:.1f}s.")
 
@@ -493,6 +567,7 @@ class KaggleDatasetBuilder:
                 orig_sr=sr,
                 vad_segments=segments,
                 is_turn_taking=is_turn_taking,
+                sample_idx=sample_count,
             )
 
             if success:
@@ -509,8 +584,8 @@ class KaggleDatasetBuilder:
                 print(f"  Reached target hours quota for this part ({self.max_hours}h).")
                 break
 
-        # Flush any remaining samples
-        self.save_current_shard()
+        # Flush any remaining samples across all partitions
+        self.flush_all()
         total_time = time.time() - t0
         print(
             f"✓ Partition Complete: {processed_sec / 3600.0:.2f} hours processed in {total_time / 60.0:.1f} minutes."
@@ -542,6 +617,19 @@ def main():
     parser.add_argument("--dataset_name", type=str, default=None, help="Custom Hugging Face dataset name (overrides dataset_type)")
     parser.add_argument("--audio_col", type=str, default="audio", help="Column name containing audio data")
     parser.add_argument("--split", type=str, default="train", help="Dataset split to stream")
+    parser.add_argument(
+        "--split_ratios",
+        type=float,
+        nargs=3,
+        default=[0.85, 0.10, 0.05],
+        help="Train, Validation, and Test split ratios (default: 0.85 0.10 0.05)",
+    )
+    parser.add_argument(
+        "--no_split",
+        action="store_true",
+        default=False,
+        help="Disable automatic Train/Val/Test subdirectories and save flat shards",
+    )
     parser.add_argument("--hf_token", type=str, default=None, help="Hugging Face access token (or set via HF_TOKEN secret)")
     parser.add_argument("--part_idx", type=int, default=0, help="Partition index (0-indexed)")
     parser.add_argument("--num_parts", type=int, default=1, help="Total number of partitions (e.g. 4 for 4x20GB)")
@@ -559,6 +647,8 @@ def main():
         max_hours_per_part=args.max_hours,
         shard_size_samples=args.shard_size,
         hf_token=hf_token,
+        split_ratios=tuple(args.split_ratios),
+        no_split=args.no_split,
     )
 
     if args.dataset_type in ["pilot", "synthetic"]:

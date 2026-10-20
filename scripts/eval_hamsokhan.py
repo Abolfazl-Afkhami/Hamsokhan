@@ -231,8 +231,14 @@ def main():
     # 3. Benchmark Streaming Latency (TTFA)
     benchmark_stream_latency(model, vocos, device, num_runs=args.num_latency_runs)
 
-    # 4. Evaluate Held-out Feature Shards
-    shard_files = sorted(glob.glob(f"{args.shard_dir}/*.safetensors"))
+    # 4. Evaluate Held-out Feature Shards (auto-detects test/ subdirectory if present)
+    test_dir = Path(args.shard_dir) / "test"
+    if test_dir.exists() and list(test_dir.glob("*.safetensors")):
+        shard_files = sorted(glob.glob(f"{test_dir}/*.safetensors"))
+        print(f"[Eval] Using dedicated held-out TEST shards from: {test_dir} ({len(shard_files)} shards)")
+    else:
+        shard_files = sorted(glob.glob(f"{args.shard_dir}/*.safetensors"))
+        print(f"[Eval] Using shards from: {args.shard_dir} ({len(shard_files)} shards)")
     evaluate_test_shards(model, shard_files, device, max_eval_samples=args.num_eval_samples)
 
     # 5. Synthesize Sample Audio
