@@ -27,12 +27,21 @@ import torch.nn.functional as F
 
 @dataclass
 class HamsokhanConfig:
-    # Backbone SLM (Qwen3-0.6B non-thinking mode)
+    # Backbone SLM (Qwen3-0.6B)
     qwen_model_name_or_path: str = "Qwen/Qwen3-0.6B"
     d_qwen: int = 1024  # 1024 for Qwen3-0.6B (or 896 for Qwen2.5-0.5B)
     qwen_num_layers: int = 28
     turn_taking_mid_layer_idx: Optional[int] = None  # Defaults to qwen_num_layers // 2
     use_4bit_quantization: bool = False  # Pure FP16 is optimal for Qwen3-0.6B (< 1.2GB VRAM on 16GB T4)
+
+    # Local Thinking & Conversational Latency Hiding (100% Offline & Local)
+    enable_local_thinking: bool = True  # Native Qwen3 local CoT reasoning
+    vocalize_thinking_tokens: bool = False  # Internal <think> tokens remain silent; only fillers and answers are vocalized
+    default_fillers: Tuple[str, ...] = (
+        "بذار یه لحظه فکر کنم...",
+        "ببین، بذار بررسی کنم...",
+        "آها، یه ثانیه به من وقت بده...",
+    )
 
     # LoRA configuration
     lora_r: int = 16
@@ -699,3 +708,17 @@ class HamsokhanModelWrapper(nn.Module):
             "mel_chunk": mel_chunk,
             "proj_state_buffer": new_proj_state,
         }
+
+    def synthesize_speech_from_text_tokens(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Synthesizes speech directly from text tokens (e.g. conversational verbal fillers or conclusion)
+        using the shared Qwen transformer and single-step Flow Synthesizer.
+        """
+        transformer_body = self._get_qwen_transformer_body()
+        qwen_out = transformer_body(
+            input_ids=input_ids,
+            output_hidden_states=False,
+            return_dict=True,
+        )
+        h_last = qwen_out.last_hidden_state
+        return self.flow_synthesizer.synthesize_single_step(h_last)
