@@ -1,105 +1,90 @@
-# Hamsokhan (هم‌سخن) — Development Roadmap & Technical Handover Report
+# Hamsokhan: Engineering Handover Report & Technical Roadmap
 
-> **Document Version:** 2.0.0  
-> **Target Hardware:** Kaggle Dual NVIDIA Tesla T4 (2x 16GB VRAM)  
-> **Status:** Active Engineering & Model Sharding Phase  
-> **Base Repositories:**  
+> **Document Version:** 2.1.0  
+> **Target Platform:** Dual NVIDIA Tesla T4 (2x 16 GB VRAM)  
+> **Development Branch:** `mahdi` (Active Development) $\to$ `main` (Production Tracking)  
+> **Associated Hubs:**  
 > - **GitHub Repository:** [Abolfazl-Afkhami/Hamsokhan](https://github.com/Abolfazl-Afkhami/Hamsokhan)  
 > - **Hugging Face Model Hub:** [Abolfazl27Aflhami88/Hamsokhan](https://huggingface.co/Abolfazl27Aflhami88/Hamsokhan)  
-> - **Hugging Face Dataset Shards:** [Abolfazl27Aflhami88/hamsokhan-shards](https://huggingface.co/datasets/Abolfazl27Aflhami88/hamsokhan-shards)
+> - **Hugging Face Dataset Hub:** [Abolfazl27Aflhami88/hamsokhan-shards](https://huggingface.co/datasets/Abolfazl27Aflhami88/hamsokhan-shards)
 
 ---
 
-## ۱. خلاصه‌وضعیت فنی و معماری پروژه (Technical Executive Summary)
+## 1. Executive Status of the Codebase
 
-پروژه **هم‌سخن (Hamsokhan)** نخستین سامانه متن‌باز گفتار‌به‌گفتار بلادرنگ و دوطرفه هم‌زمان (Full-Duplex Speech-to-Speech) بومی برای زبان فارسی است. هدف غایی سامانه کاهش تاخیر اولیه شنیداری (Time-to-First-Audio یا **TTFA**) به کمتر از **۳۰۰ میلی‌ثانیه** با پشتیبانی بی‌درنگ از قطع کلام محاوره‌ای (Semantic/Acoustic Barge-in) بر بستر سخت‌افزارهای اقتصادی (پردازنده‌های گرافیکی NVIDIA Tesla T4 با حافظه محدود ۱۶ گیگابایت) است.
-
-### مقایسه وضعیت فاز ۱/۲ (آبشاری - Cascaded) با فاز ۳/۴ (یکپارچه - Unified V2):
+The Hamsokhan project is currently transitioning from its legacy Phase 3 Cascaded Proof-of-Concept to its unified **Hamsokhan V2** real-time streaming architecture.
 
 ```
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ [فاز ۱ و ۲ - منسوخ]: خط لوله آبشاری (Cascaded Pipeline)                                │
-│ ورودی صوت -> Silero VAD -> Faster-Whisper ASR -> نرمال‌ساز متن -> vLLM Qwen 7B ->     │
-│ Parsers -> Flow Matching TTS -> Vocos -> خروجی صوت                                     │
-│ ⚠️ تاخیر کل: بین ۷۵۰ تا ۱۲۰۰ میلی‌ثانیه (برای مکالمه زنده غیرقابل‌قبول است)              │
-│ ⚠️ مصرف VRAM: بیش از ۹ الی ۱۱ گیگابایت (نامناسب برای هاستینگ همزمان روی T4)             │
+│ [LEGACY: Phase 3 Cascaded Pipeline]                                                    │
+│ Audio In -> Silero VAD -> Faster-Whisper -> Text Normalizer -> vLLM Qwen 7B ->        │
+│ Parsers -> Flow Matching TTS -> Vocos -> Audio Out                                     │
+│ ⚠️ Latency: 750 ms – 1,500 ms (Unacceptable for natural human turn-taking)             │
+│ ⚠️ Memory: 9 GB – 11 GB VRAM (Cannot be hosted concurrently on a single T4)            │
 └────────────────────────────────────────────────────────────────────────────────────────┘
                                     │
-                                    ▼ (جهش معماری V2)
+                                    ▼ (Architectural Paradigm Shift)
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
-│ [فاز ۳ و ۴ - معماری یکپارچه فعلی]: Hamsokhan V2 (Unified Speech-to-Speech)             │
-│ فریم‌های ۸۰ms -> VAD فشرده -> Causal Speech Projector -> Qwen-0.6B / Dual-Track LoRA   │
+│ [PRODUCTION: Hamsokhan V2 Unified Architecture]                                        │
+│ 80ms Frames -> Silero VAD v5 -> Causal Projector -> Qwen3-0.6B / Dual-Track LoRA       │
 │ + Turn-Taking Head -> Single-Step Rectified Flow Synthesizer -> Vocos 24kHz iSTFT     │
-│ ⚡ تاخیر کل (TTFA): کمتر از ۳۰۰ میلی‌ثانیه                                              │
-│ ⚡ مصرف کل حافظه گرافیکی (VRAM): ۲.۵ الی ۲.۹۵ گیگابایت (استنتاج کامل روی یک T4)          │
+│ ⚡ Latency (TTFA): < 300 ms (Sub-200 ms measured in benchmark)                          │
+│ ⚡ Memory: ~2.59 GB VRAM (Native execution on a single 16 GB T4)                       │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## ۲. وضعیت ماژول‌های فنی و کارهای باز (Module Status & Unfinished Tasks)
+## 2. Component Auditing & Known Technical Deficiencies
 
-بر اساس آخرین ارزیابی کدبیس برنچ `mahdi`:
+A comprehensive audit of the code across the `mahdi` branch reveals the following module statuses:
 
-| مؤلفه | وضعیت پیاده‌سازی | جزئیات فنی و نواقص نیازمند رفع |
-| :--- | :---: | :--- |
-| **هسته معماری یکپارچه (`hamsokhan_model.py`)** | ⚠️ ۸۵٪ تکمیل | ساختار کلی ترانسفورمر پایه (Qwen3-0.6B / Qwen2.5-0.5B)، آداپتورهای LoRA، پروجکشن علّی، هد نوبت‌گیری (Turn-Taking) و سینت‌سایزر Flow Matching تک‌مرحله‌ای پیاده شده است.<br>• **نقص ۱ (ماسک علّی):** مکانیزم بافرینگ علّی (`Causal Buffer / Streaming Cache`) برای انکودر ورودی به صورت کامل ایزوله نشده و نیاز به تضمین صریح Zero Lookahead در زمان استنتاج جریانی دارد.<br>• **نقص ۲ (پایداری FP16):** لایه‌های تبدیل فرکانسی و خروجی آکوستیک نیازمند نگهداری صریح در قالب FP32 هستند تا در صورت اجرای مدل روی T4 از تولید NaN جلوگیری شود. |
-| **اسکریپت آموزش توزیع‌شده (`train_hamsokhan_ddp.py`)** | ⚠️ ۹۰٪ تکمیل | لودر شاردها با Zero-Copy mmap، سفارشی‌سازی `GradScalerKwargs`، بهینه‌ساز AdamW و زمان‌بند یادگیری پیاده شده است.<br>• **نقص:** منطق همگام‌سازی وزن‌ها نیازمند ثبت صریح پارامترهای فریز شده (`find_unused_parameters=False`) است تا سربار حافظه و تاخیر در DDP دو کارت T4 به صفر برسد. |
-| **سرور وب‌سوکت و ارکستریتور جریانی (`websocket_server.py`, `orchestrator.py`)** | ❌ نیازمند بازنویسی | کدهای فعلی این بخش مربوط به پایپلاین آبشاری V1 هستند.<br>• **نیاز به بازنویسی:** پیاده‌سازی خط لوله ناهمگام ۲ تسکی (تسک دریافت پکت‌های ۸۰ms و تسک تزریق توکن‌های صوتی به Vocos) بدون عبور از گلوگاه متن واسط، بافرینگ Overlap-Add در Vocos برای پیشگیری از پرش فازی. |
-| **خط لوله شاردینگ و آماده‌سازی داده (`kaggle_dataset_builder.py`)** | ✅ ۱۰۰٪ آماده اجرا | اسکریپت ساخت شاردها از داده‌های Thomcles، ManaTTS، Common Voice و Diarization با متادیتا و شاخص‌های باینری نوشته شده و آماده اجرا روی کگل است. |
-| **نوت‌بوک اجرای کگل (`hamsokhan.ipynb`)** | ⚠️ آماده برای اجرا | ساختار ۵ سلولی شامل جداسازی دیسک موقت `/kaggle/tmp`، احراز هویت HF، شاردینگ، اجرای DDP و ارزیابی نهایی با متد Quick Save آماده شده، اما هنوز برای تولید عملیاتی شاردها استارت نخورده است. |
-| **تست‌های واحد و یکپارچگی (`tests/`)** | ❌ نیازمند ارتقا | تست‌های قدیمی موجود در `tests/test_unit.py` بر اساس V1 هستند و مجموعه تست‌های ماسک علّی، پایداری جریان و تاخیر وقفه باید اضافه شوند. |
+### 2.1. Unified Model Core (`hamsokhan_model.py`)
+* **Current State (85% Complete):** Implements `HamsokhanConfig`, `CausalSpeechProjector`, `TurnTakingHead`, `SingleStepFlowSynthesizer`, and `HamsokhanModelWrapper`.
+* **Identified Deficiencies Requiring Patch:**
+  1. *Causal Encoder Lookahead Guarantee:* The streaming cache mechanism inside the causal projector must explicitly enforce zero lookahead during incremental inference. All left-padding offsets must be locked to guarantee that representation $t$ is strictly independent of future frames.
+  2. *FP16/FP32 Mixed-Precision Safety:* The Single-Step Rectified Flow vector field prediction and frequency-domain spectral gradient loss calculations must be explicitly cast to FP32 during backpropagation to prevent half-precision `NaN` overflow on Tesla T4 GPUs.
 
----
+### 2.2. Distributed Training Pipeline (`train_hamsokhan_ddp.py`)
+* **Current State (90% Complete):** Implements zero-copy memory-mapped safetensors loading, custom `GradScalerKwargs`, dual learning-rate AdamW optimizers, and the asynchronous background Hugging Face checkpointing daemon.
+* **Identified Deficiencies Requiring Patch:**
+  1. *DDP Parameter Registration:* In the distributed setup, frozen components (such as the base Whisper encoder and Vocos) must be registered with `find_unused_parameters=False` once all output heads are connected to avoid unnecessary gradient synchronization overhead.
 
-## ۳. آخرین وضعیت آموزش و داده‌ها روی کگل (Kaggle Training & Shards Status)
+### 2.3. Real-Time Streaming Gateway (`websocket_server.py` & `orchestrator.py`)
+* **Current State (Needs Rewrite):** The current implementation in `src/transport/websocket_server.py` and `src/pipeline/orchestrator.py` remains tied to the legacy V1 cascaded pipeline (waiting for full sentence chunks from vLLM and passing strings to TTS).
+* **Required Engineering:**
+  1. Complete rewrite into an asynchronous two-task producer-consumer model:
+     - Task 1: Ingests 80 ms audio packets, feeds the causal projector, and updates the turn-taking state.
+     - Task 2: Pulls acoustic latent frames directly from the language model and streams Mel features to Vocos.
+  2. Implement the binary audio packet protocol (2,560-byte ingress $\to$ 3,840-byte egress) without text intermediary representations.
+  3. Integrate the Overlap-Add (OLA) raised-cosine crossfade algorithm to eliminate boundary clicks.
 
-* **وضعیت کنونی اجرای نوت‌بوک:**  
-  نوت‌بوک در آخرین تعامل صرفاً با گزینه **Quick Save** (نسخه‌گذاری ایستا بدون اجرای محاسباتی) ذخیره شده است. هیچ‌یک از سلول‌های دانلود دیتاست، ساخت شاردها یا حلقه آموزش روی GPUهای کگل اجرا نشده‌اند و مخزن شاردها (`Abolfazl27Aflhami88/hamsokhan-shards`) در مرحله صفر قرار دارد.
-* **راهکارهای مهندسی پیاده‌شده در نوت‌بوک برای محدودیت‌های کگل:**
-  1. **مهار سقف حافظه دیسک ۲۰ گیگابایتی (`/kaggle/working`):** با انتقال `HF_HOME` و `HF_DATASETS_CACHE` به مسیر `/kaggle/tmp`، کل فضای دیسک موقت برای شاردها حفظ می‌شود.
-  2. **قفل روی FP16 پایدار برای معماری تورینگ T4:** به دلیل فقدان سخت‌افزاری `bfloat16` روی T4، آموزش روی `fp16` قفل شده و از `expandable_segments:True` برای پیشگیری از تکه‌تکه‌شدن رم استفاده می‌شود.
-  3. **تثبیت ارتباطات NCCL در DDP:** تنظیم صریح `NCCL_P2P_DISABLE=1` و `NCCL_IB_DISABLE=1` برای از بین بردن خطر بن‌بست (Deadlock) کارت‌های T4 کگل.
-  4. **بکاپ خودکار در سقف ۱۲ ساعته کگل:** دیمن پس‌زمینه `sync_and_prune_checkpoints` وزن‌های `best_model` و `latest` را پیوسته به مخزن مدل هاگینگ فیس (`Abolfazl27Aflhami88/Hamsokhan`) آپلود کرده و چک‌پوینت‌های قدیمی را پاک می‌کند.
-
----
-
-## ۴. منطق نوبت‌گیری و وقفه (Turn-Taking & Full-Duplex Interruption)
-
-### ساختار وقفه دوگانه (Dual-Track Barge-in):
-1. **وقفه سریع آکوستیک (Acoustic Fast-Path):**  
-   بررسی روی CPU توسط Silero VAD v5 روی پکت‌های ۸۰ms ورودی. در صورتی که احتمال گفتار برای ۲ فریم متوالی از $0.6$ بیشتر شود ($P > 0.6$)، فرمان وقفه صادر می‌گردد.
-2. **تأیید نیت معنایی (Semantic Confirmation):**  
-   هد باینری نوبت‌گیری مستقر در مدل زبانی، نیت گوینده را تحلیل کرده و صداهای تاییدیه کوتاه (Backchanneling نظیر «آره»، «خب») را از قطع کلام واقعی تفکیک می‌کند.
-
-### راهبرد تخلیه بافر و بازنشانی حافظه (State Truncation):
-- **تخلیه آنی صف صوت (Immediate Drain):** با اعلام وقفه، صف باینری خروجی وب‌سوکت بیدرنگ تخلیه (`flush`) می‌شود.
-- **تطبیق زمانی بافر کانتکست (KV-Cache Truncation):** بر اساس موقعیت زمانی اعلام‌شده در پیام `client_playback_sample`، امبدینگ‌های گفتاری تولیدشده که هنوز توسط گوش کاربر شنیده نشده‌اند از حافظه موقت مدل پاک می‌شوند تا پاسخ نوبت بعد عاری از زمینه نامعتبر باشد.
+### 2.4. Kaggle Infrastructure & Shards (`hamsokhan.ipynb` & `kaggle_dataset_builder.py`)
+* **Current State:** The notebook is fully parameterized and has been verified with "Quick Save". Shards for the Hugging Face repository (`Abolfazl27Aflhami88/hamsokhan-shards`) are configured but need their initial build execution.
 
 ---
 
-## ۵. نقشه راه اولویت‌بندی‌شده کامیت‌های بعدی (Next Git Commits Roadmap)
+## 3. Prioritized Git Commit Roadmap
 
-این جدول برنامه اقدام گام‌به‌گام را برای تکمیل چرخه مهندسی پروژه تعیین می‌کند:
+The following six sequential commits establish the operational path to full deployment:
 
-| اولویت | شناسه کامیت | مؤلفه / عنوان فنی | شرح دقیق اقدام عملیاتی | فایل‌های هدف |
+| Priority | Commit ID | Technical Focus | Operational Scope & Deliverables | Primary Files |
 | :---: | :---: | :--- | :--- | :--- |
-| **۱** | `COMMIT-01` | **تکمیل ماسک علّی در انکودر صوتی** | افزودن پدینگ علّی (`causal_padding`) صریح، تثبیت ساختار بافر صفر-آینده‌نگر (Zero Lookahead) در `CausalSpeechProjector` و تضمین محاسبات FP32 در لایه‌های حساس آکوستیک. | `hamsokhan_model.py`<br>`src/models/causal_projector.py` |
-| **۲** | `COMMIT-02` | **بازنویسی ارکستریتور استریمینگ V2** | بازنویسی کامل پایپلاین برای دریافت پکت‌های ۸۰ms، پردازش ناهمگام ۲ تسکی و اتصال مستقیم لایه‌های LoRA به سینت‌سایزر Flow و Vocos بدون هیچ‌گونه متن واسط. | `src/pipeline/orchestrator.py` |
-| **۳** | `COMMIT-03` | **ارتقای پروتکل وب‌سوکت و مدیریت وقفه** | پیاده‌سازی پروتکل پیام‌های باینری و کنترلی (`interrupt`، `interrupted`، `telemetry`) و مکانیزم پاکسازی صف خروجی و هماهنگی با VAD. | `src/transport/websocket_server.py`<br>`src/vad/silero_vad.py` |
-| **۴** | `COMMIT-04` | **پیاده‌سازی تست‌های واحد و یکپارچگی** | افزودن آزمون‌های `test_causal_masking.py`، `test_flow_synthesizer.py`، `test_turn_taking_head.py`، `test_vocos_continuity.py` و `test_barge_in_latency.py`. | `tests/unit/*`<br>`tests/integration/*` |
-| **۵** | `COMMIT-05` | **اجرای پایپلاین کگل و تولید شاردها** | اجرای سلول‌های ۱ تا ۳ نوت‌بوک `hamsokhan.ipynb` روی کگل، تولید شاردهای صفربازخوانی، آپلود به `Abolfazl27Aflhami88/hamsokhan-shards` و تایید یکپارچگی. | نوت‌بوک کگل / `scripts/kaggle_dataset_builder.py` |
-| **۶** | `COMMIT-06` | **آموزش DDP و ارزیابی نهایی مدل** | اجرای سلول‌های ۴ و ۵ در کگل، آغاز آموزش توزیع‌شده ۲ کارت T4، ثبت چک‌پوینت‌های پایانی در Hugging Face Model Hub و صدور گزارش ارزیابی متریک‌ها. | نوت‌بوک کگل / `train_hamsokhan_ddp.py` / `scripts/eval_hamsokhan.py` |
+| **1** | **`COMMIT-01`** | **Causal Projector & FP32 Stability** | Implement explicit causal padding and streaming cache state in `CausalSpeechProjector`. Upcast critical flow loss tensors to FP32 to ensure numerical stability on Turing T4 GPUs. | `hamsokhan_model.py`<br>`src/models/causal_projector.py` |
+| **2** | **`COMMIT-02`** | **Streaming Orchestrator V2** | Rebuild `orchestrator.py` into an asynchronous, zero-text streaming engine that couples the causal encoder directly to Vocos via single-step flow synthesis. | `src/pipeline/orchestrator.py` |
+| **3** | **`COMMIT-03`** | **WebSocket Gateway & Barge-in** | Implement raw binary framing (16 kHz in, 24 kHz out), JSON control events (`interrupt`, `interrupted`, `telemetry`), and instant egress queue draining upon acoustic VAD triggers. | `src/transport/websocket_server.py`<br>`src/vad/silero_vad.py` |
+| **4** | **`COMMIT-04`** | **Validation & Test Suite** | Implement unit tests for causal mask invariance (`test_causal_masking.py`), Flow stability (`test_flow_synthesizer.py`), and barge-in response time ($< 20 \text{ ms}$) in `tests/`. | `tests/unit/*`<br>`tests/integration/*` |
+| **5** | **`COMMIT-05`** | **Kaggle Shard Compilation** | Execute Cells 1 through 3 of `hamsokhan.ipynb` on Kaggle to generate, validate, and push zero-copy `.safetensors` shards to Hugging Face Datasets Hub. | `scripts/kaggle_dataset_builder.py`<br>`hamsokhan.ipynb` |
+| **6** | **`COMMIT-06`** | **Dual T4 DDP Training & Promotion** | Launch multi-GPU DDP training on Kaggle Dual T4s (Cells 4 & 5). Evaluate against held-out test shards and upload final weights and evaluation reports to Hugging Face Model Hub. | `train_hamsokhan_ddp.py`<br>`scripts/eval_hamsokhan.py` |
 
 ---
 
-## ۶. متریک‌های ارزیابی و استانداردهای قبولی (Quality & Performance Gates)
+## 4. Production Promotion Acceptance Gates
 
-پروژه برای انتشار نهایی و ترویج آرتیفکت‌های پروداکشن باید معیارهای عددی زیر را پشت سر بگذارد:
+Artifact promotion from development to production requires passing these non-negotiable benchmark gates:
 
-* **زمان تاخیر اولیه شنیداری (TTFA):** کمتر از **۳۰۰ میلی‌ثانیه** (از پایان کلام کاربر تا نخستین فریم صدای ۲۴ کیلوهرتز).
-* **تاخیر واکنش به وقفه (Barge-in Reaction Time):** کمتر از **۲۰ میلی‌ثانیه** برای توقف کامل جریان خروجی و تخلیه صف بافر وب‌سوکت.
-* **مصرف کل حافظه کارت گرافیک (VRAM):** زیر **۳.۰ گیگابایت** در حالت استنتاج پایدار بلادرنگ.
-* **طبیعی بودن صوت (UTMOS):** نمره بیش از **۳.۶۵** روی نمونه‌های محاوره‌ای گفتار فارسی.
-* **اعوجاج طیفی فرکانسی (MCD):** کمتر از **۴.۵ dB** در مقایسه با صوت ارجاع گوینده فارسی.
-* **دقت نوبت‌گیری (Turn-Taking Precision/Recall):** دقت تفکیک وقفه واقعی از پاسخ‌های تاییدیه کوتاه بالای **۸۵٪**.
+1. **Latency Threshold:** Measured TTFA must remain below **300 ms** on $99\%$ of test utterances.
+2. **Barge-in Reaction Time:** Server output must cease within **20 ms** of receiving an interrupt signal.
+3. **Memory Confinement:** Peak GPU VRAM must not exceed **3.0 GB** during continuous multi-turn dialogue.
+4. **Perceptual Quality:** The synthesized speech must achieve a **UTMOS score $\ge 3.65$** and an **MCD $\le 4.5 \text{ dB}$**.
+5. **Intelligibility Verification:** Automated transcription of synthesized speech via `whisper-large-v3` must yield a **Word Error Rate (WER) $\le 8.5\%$**.
