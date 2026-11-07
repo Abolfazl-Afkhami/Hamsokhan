@@ -1,24 +1,24 @@
-# Hamsokhan (هم‌سخن) — Kaggle Dual T4 Training & Optimization Guide
+# Hamsokhan: Kaggle Dual Tesla T4 Distributed Training Guide
 
-> **Hardware Target:** 2x NVIDIA Tesla T4 (Dual-GPU, 16GB VRAM each, Turing sm_75)  
-> **Orchestrator:** PyTorch Distributed Data Parallel (DDP) via Hugging Face `accelerate`  
-> **Model Repository:** [huggingface.co/Abolfazl27Aflhami88/Hamsokhan](https://huggingface.co/Abolfazl27Aflhami88/Hamsokhan)  
-> **Dataset Shards:** [huggingface.co/datasets/Abolfazl27Aflhami88/hamsokhan-shards](https://huggingface.co/datasets/Abolfazl27Aflhami88/hamsokhan-shards)
+> **Hardware Specification:** 2x NVIDIA Tesla T4 GPUs (16 GB GDDR6 VRAM each, Turing `sm_75`)  
+> **Distributed Framework:** PyTorch Distributed Data Parallel (DDP) via Hugging Face `accelerate`  
+> **Target Model Hub:** [huggingface.co/Abolfazl27Aflhami88/Hamsokhan](https://huggingface.co/Abolfazl27Aflhami88/Hamsokhan)  
+> **Target Shard Hub:** [huggingface.co/datasets/Abolfazl27Aflhami88/hamsokhan-shards](https://huggingface.co/datasets/Abolfazl27Aflhami88/hamsokhan-shards)
 
 ---
 
-## ۱. مرور خط لوله آموزش کگل (Kaggle Training Architecture)
+## 1. Overview & Distributed Execution Topology
 
-آموزش مدل‌های یکپارچه گفتار‌به‌گفتار به طور معمول نیازمند خوشه‌های پردازشی گران‌قیمت نظیر ۸ کارت H100 یا A100 است. سامانه **هم‌سخن** به گونه‌ای معماری شده است که فرآیند تنظیم دقیق (Fine-Tuning) لایه‌های LoRA، پروجکتور علّی، هد نوبت‌گیری و سینت‌سایزر صوتی را به صورت پایدار بر روی **دو کارت گرافیک ارزان‌قیمت NVIDIA Tesla T4 کگل** به اتمام برساند.
+Training modern speech-to-speech architectures typically requires multi-GPU enterprise infrastructure (such as $8\times$ A100 or H100 pods). Hamsokhan circumvents this barrier by distributing the training of its causal projector, Dual-Track LoRA adapters, Turn-Taking classification head, and Single-Step Rectified Flow synthesizer across **two commodity Tesla T4 GPUs** on Kaggle.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────┐
 │                             Kaggle Dual T4 Execution                             │
 │                                                                                  │
-│   [GPU 0: T4 16GB] (Rank 0)                     [GPU 1: T4 16GB] (Rank 1)        │
-│   • DDP Local Batch (FP16)                      • DDP Local Batch (FP16)         │
-│   • Forward / Backward                          • Forward / Backward             │
-│   • Master Checkpoint Thread (Background)       • Worker Gradient Sync           │
+│   [GPU 0: T4 16 GB] (Rank 0 - Master)          [GPU 1: T4 16 GB] (Rank 1)        │
+│   • DDP Local Batch (FP16 Native)              • DDP Local Batch (FP16 Native)   │
+│   • Forward / Backward Pass                    • Forward / Backward Pass         │
+│   • Non-Blocking Background Daemon             • Worker Gradient Sync            │
 │                           │                              │                       │
 │                           └──────────────┬───────────────┘                       │
 │                                          ▼                                       │
@@ -36,75 +36,85 @@
 
 ---
 
-## ۲. مهار محدودیت‌های سخت‌افزاری کگل (T4 Constraints & Solutions)
+## 2. Platform Constraints & Systems Engineering Solutions
 
-کارت‌های تسلا T4 در پلتفرم کگل چالش‌های سخت‌افزاری ویژه‌ای دارند که در پایپلاین هم‌سخن با تکنیک‌های زیر مهار شده‌اند:
+Operating inside the free Kaggle GPU runtime presents four critical systems challenges. Hamsokhan resolves each through targeted low-level optimizations:
 
-### ۲.۱. سقف فضای دیسک ۲۰ گیگابایتی (`/kaggle/working`)
-دانلود دیتاست‌های خام صوتی به سرعت دیسک ۲۰ گیگابایتی کگل را پر کرده و منجر به خطای مرگبار `No space left on device` می‌شود.
-* **راهکار:** پارتیشن موقت `/kaggle/tmp` دارای دیسک جداگانه با سهمیه بالاتری است. با بازتنظیم متغیرهای سیستمی:
+### 2.1. Mitigating the 20 GB Disk Quota Limit (`/kaggle/working`)
+Downloading multi-speaker Persian audio datasets and extracting raw `.wav` archives rapidly exceeds the strict 20 GB root volume, throwing `OSError: [Errno 28] No space left on device`.
+* **Engineering Solution:** Kaggle provisions an unmetered, ephemeral temporary mount at `/kaggle/tmp`. By configuring global environment variables prior to importing machine learning frameworks, all large caching operations are offloaded away from the persistent workspace:
   ```python
   os.environ["HF_HOME"] = "/kaggle/tmp/hf_home"
   os.environ["HF_DATASETS_CACHE"] = "/kaggle/tmp/hf_datasets_cache"
   os.environ["TORCH_HOME"] = "/kaggle/tmp/torch_cache"
   os.environ["TMPDIR"] = "/kaggle/tmp"
   ```
-  کل فضای دانلود و کش‌های واسط به مسیر موقت منتقل شده و فضای `/kaggle/working` منحصراً به فایل‌های شارد نهایی و کدها اختصاص می‌یابد.
+  The primary `/kaggle/working` directory is reserved strictly for compiled, zero-copy `.safetensors` dataset shards.
 
-### ۲.۲. فقدان سخت‌افزاری Bfloat16 در کارت‌های معماری تورینگ (T4)
-کارت‌های سری Turing از فرمت محاسباتی `bfloat16` پشتیبانی سخت‌افزاری نمی‌کنند. در صورتی که آموزش روی این فرمت اجرا شود، سرعت محاسبات به دلیل شبیه‌سازی نرم‌افزاری به شدت افت کرده یا با شکست مواجه می‌شود.
-* **راهکار:** قفل کامل محاسبات بر روی `fp16` با تنظیمات اختصاصی گرادیان اسکیلر (`GradScalerKwargs`):
+### 2.2. FP16 Numerical Stability on Turing GPUs (No BF16 Support)
+The Turing architecture (Compute Capability 7.5, Tesla T4) does not possess hardware units for Brain Floating Point (`bfloat16`). Emulating `bfloat16` in software destroys training throughput, while uncalibrated `float16` suffers catastrophic underflow in the flow matching ODE gradients or explosive overflow in the asymmetric focal loss.
+* **Engineering Solution:** We enforce pure FP16 execution stabilized via a custom-calibrated `GradScaler`:
   ```python
+  from accelerate.utils import GradScalerKwargs
+
   scaler_kwargs = GradScalerKwargs(
-      init_scale=2**14,      # مقیاس اولیه پایدار برای جلوگیری از سرریز
-      growth_interval=1000,  # افزایش آرام مقیاس جهت جلوگیری از تولید NaN
+      init_scale=2**14,      # Initial scale factor of 16,384 prevents initial zero-grad underflow
+      growth_interval=1000,  # Slow upward scale adjustment prevents sudden NaN loss spikes
   )
   ```
-  همچنین متغیر محیطی `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` مانع از تکه‌تکه‌شدن قطعات حافظه در کارت‌های ۱۶ گیگابایتی می‌شود.
+  Additionally, `PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"` is set to prevent CUDA memory pool fragmentation over long training runs.
 
-### ۲.۳. بن‌بست ارتباطی NCCL در DDP کگل
-در برخی موارد، ارتباط نقطه به نقطه کارت‌های گرافیک در کرنل لینوکس کگل دچار قفل پیوسته (Deadlock) می‌شود.
-* **راهکار:** غیرفعال‌سازی صریح ارتباطات هم‌سطح پی‌سی‌آی و InfiniBand در سطح محیط سیستم:
+### 2.3. Resolving NCCL Inter-GPU Deadlocks
+Kaggle's virtualized container network occasionally hangs during peer-to-peer (P2P) CUDA inter-process handshakes, causing the PyTorch DDP all-reduce phase to hang indefinitely.
+* **Engineering Solution:** We disable P2P and InfiniBand kernel invocations, forcing NCCL to communicate via shared system memory:
   ```python
   os.environ["NCCL_P2P_DISABLE"] = "1"
   os.environ["NCCL_IB_DISABLE"] = "1"
   ```
 
-### ۲.۴. سقف زمانی ۱۲ ساعته سشن‌های کگل (Session Timeout)
-سشن‌های پردازشی کگل پس از حداکثر ۱۲ ساعت به صورت خودکار نابود می‌شوند.
-* **راهکار:** پیاده‌سازی سیستم آپلود پیوسته و ناهمگام در ماژول `train_hamsokhan_ddp.py`:
-  - یک ریسه پس‌زمینه (Background Thread) به موازات آموزش فعال است.
-  - هر ۵۰۰ گام، وزن‌های آموزش‌پذیر مدل (LoRA + Projector + Synthesizer) را روی حافظه RAM ذخیره کرده و به مخزن هاگینگ‌فیس `Abolfazl27Aflhami88/Hamsokhan` ارسال می‌کند.
-  - چک‌پوینت‌های قدیمی از حافظه محلی حذف می‌شوند تا سهمیه دیسک اشغال نماند.
+### 2.4. Surviving the 12-Hour Session Kill Window
+Kaggle kernel sessions are terminated after 12 hours of continuous execution. Training runs that fail to save state are permanently lost.
+* **Engineering Solution:** `train_hamsokhan_ddp.py` integrates an asynchronous, multi-threaded checkpointing daemon (`AsyncHFHubCheckpointManager`):
+  1. Rank 0 clones trainable parameters into pinned host RAM (CPU memory).
+  2. A background worker thread serializes tensors to `.safetensors` format without stalling GPU compute.
+  3. The worker pushes `best_model` and `latest` checkpoints directly to the target Hugging Face repository via `huggingface_hub.HfApi`.
+  4. Rolling pruning deletes historical step directories from local disk, keeping local storage under 2 GB.
 
 ---
 
-## ۳. راهنمای گام‌به‌گام نوت‌بوک کگل (`hamsokhan.ipynb`)
+## 3. Kaggle Notebook Walkthrough (`hamsokhan.ipynb`)
 
-نوت‌بوک مرجع پروژه از ۵ گام مجزا و مستقل تشکیل شده است:
+The orchestration notebook is structured into 5 deterministic execution cells:
 
-### گام ۱: آماده‌سازی محیط و نصب وابستگی‌ها
-- تنظیم متغیرهای محیطی برای جداسازی کش‌ها در `/kaggle/tmp`.
-- تایید در دسترس بودن هر دو کارت گرافیک NVIDIA T4 با متد `torch.cuda.device_count() == 2`.
-- کلون شاخه `mahdi` مخزن گیت‌هاب `Abolfazl-Afkhami/Hamsokhan`.
-- نصب پیش‌نیازهای اختصاصی صوتی و مدل‌سازی (`accelerate`, `safetensors`, `librosa`, `soundfile`).
+### Cell 1: Environment & Hardware Isolation
+* Verifies dual GPU availability (`torch.cuda.device_count() == 2`).
+* Configures `/kaggle/tmp` isolation paths.
+* Clones the active `mahdi` branch of `Abolfazl-Afkhami/Hamsokhan`.
+* Installs compiled dependencies: `accelerate`, `safetensors`, `soundfile`, `librosa`.
 
-### گام ۲: احراز هویت در هاگینگ‌فیس هاب و بازیابی چک‌پوینت
-- خواندن ایمن توکن کاربر (`HF_TOKEN`) از بخش Kaggle Secrets.
-- لاگین در هاب و ایجاد خودکار مخازن مدل (`Abolfazl27Aflhami88/Hamsokhan`) و دیتاست (`Abolfazl27Aflhami88/hamsokhan-shards`).
-- جستجوی آخرین چک‌پوینت ثبت‌شده در هاب جهت از سرگیری خودکار (`resume_from_checkpoint`).
+### Cell 2 & 3: Hugging Face Authentication & Checkpoint Recovery
+* Retrieves the user's `HF_TOKEN` securely via `kaggle_secrets.UserSecretsClient`.
+* Logs in to the Hugging Face API and provisions repositories:
+  - Model Hub: `Abolfazl27Aflhami88/Hamsokhan`
+  - Dataset Hub: `Abolfazl27Aflhami88/hamsokhan-shards`
+* Queries the Model Hub; if a prior checkpoint exists, it is automatically restored to resume training seamlessly.
 
-### گام ۳: شاردینگ باینری و همگام‌سازی کش
-- بررسی وجود شاردهای پیش‌ساخته در هاب.
-- در صورت عدم وجود شاردها، اجرای اسکریپت `scripts/kaggle_dataset_builder.py`:
-  - دانلود و پالایش داده‌های صوتی فارسی (Thomcles, ManaTTS, Common Voice, Diarization).
-  - تبدیل به شاردهای فشرده `.safetensors` بدون کپی حافظه (Zero-Copy mmap) با دسته‌بندی `train`, `val`, `test`.
-  - آپلود خودکار شاردها به هاب جهت استفاده‌های آتی بدون نیاز به بازسازی.
+### Cell 4 & 5: Idempotent Shard Synchronization
+* Checks the Hugging Face Dataset Hub for existing pre-built shards.
+* If absent or if `FORCE_REBUILD_SHARDS = True`, triggers `scripts/kaggle_dataset_builder.py`:
+  - Curates audio from **Thomcles (417h)**, **ManaTTS (114h)**, **PersianVox (150h)**, and **Synthetic Diarization (60h)**.
+  - Normalizes audio to $-20 \text{ dBFS}$ at 24 kHz.
+  - Extracts 100-bin log-Mel spectrograms and generates zero-copy `.safetensors` binary shards for `train`, `val`, and `test` splits.
+  - Pushes shards to `Abolfazl27Aflhami88/hamsokhan-shards`.
 
-### گام ۴: آغاز آموزش موازی (Multi-GPU DDP Training)
-- فراخوانی `accelerate launch` با تنظیمات توزیع‌شده برای دو کارت T4:
+### Cell 6 & 7: Dual-GPU DDP Training Launch
+* Dispatches distributed execution via `accelerate launch`:
   ```bash
-  accelerate launch --multi_gpu --num_processes 2 train_hamsokhan_ddp.py \
+  accelerate launch \
+      --multi_gpu \
+      --num_processes 2 \
+      --mixed_precision fp16 \
+      train_hamsokhan_ddp.py \
       --shard_dir /kaggle/working/cached_shards \
       --output_dir /kaggle/working/ckpts \
       --batch_size 4 \
@@ -113,13 +123,14 @@
       --lr_synthesizer 2e-4 \
       --max_steps 15000
   ```
-- فعال‌سازی ریسه پشتیبان‌گیر خودکار در هاگینگ‌فیس هاب.
+* Spawns the non-blocking checkpoint sync thread.
 
-### گام ۵: ارزیابی قطعی و ترویج مدل پروداکشن (Evaluation & Promotion)
-- استخراج بهترین مدل ذخیره‌شده (`best_model/trainable_hamsokhan.safetensors`).
-- ارزیابی سخت‌گیرانه روی شاردهای آزمون مستقل (`test shards`):
-  - اندازه‌گیری خطای بازسازی فرکانسی (`Mel L1 Loss`) و گرادیان طیفی (`SpecGrad`).
-  - ارزیابی دقت کلاسیفایر نوبت‌گیری (`Turn-Taking Precision/Recall`).
-  - اندازه‌گیری تاخیر زمانی رسیدن به نخستین فریم صوتی (`TTFA`).
-- تولید و رندر یک فایل صوتی ۲۴ کیلوهرتز سنتزشده به زبان فارسی در خروجی نوت‌بوک.
-- آپلود نهایی وزن‌های تاییدشده به همراه گزارش ارزیابی کامل (`evaluation_report.json`) در هاگینگ‌فیس هاب.
+### Cell 8 & 9: Deterministic Evaluation & Production Promotion
+* Loads the best checkpoint strictly against held-out `test` shards.
+* Runs `scripts/eval_hamsokhan.py` to compute:
+  - Mel L1 Reconstruction Loss
+  - Spectral Gradient Error (`SpecGrad`)
+  - Turn-Taking Binary Classification Accuracy & F1-score
+  - Time-to-First-Audio (TTFA) benchmark
+* Synthesizes and plays a 24 kHz Persian audio sample within the notebook output.
+* Tags and promotes verified model weights as production-ready artifacts on the Hugging Face Model Hub.
